@@ -1,8 +1,8 @@
 #pragma once
 
 // Device side of the fused int8-activation GEMV (see comment below). Kernels are instantiated in
-// comp_units/exl3_gemv_int8_inst_*.cu; the host code in exl3_gemv_int8.cu includes this header only
-// for the launch-geometry constants and __host__ __device__ helpers
+// comp_units/exl3_gemv_int8_inst_*.cu. exl3_gemv_int8.cu also uses the same device body for
+// the bundled Inkling projection.
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -1002,21 +1002,19 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
-__global__ __launch_bounds__(NUM_THREADS)
-void exl3_gemv_int8_sq_kernel
-(
-    const half* __restrict__ A,
-    const uint16_t* __restrict__ B,
-    void* __restrict__ C,
-    const int size_m,       // 1 <= size_m <= M
-    const int size_k,
-    const int size_n,
-    int* __restrict__ locks,
-    const half* __restrict__ suh,
-    half* __restrict__ A_had,
-    const half* __restrict__ svh
-)
+__host__ __device__ inline int gemv_sq_rows(int size_k, int size_n, int grid, int M, bool residual)
+{
+    int rows = size_k / 16;
+    int r = CEIL_DIVIDE(rows * (size_n / 256), grid);
+    int per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
+    return MIN(MIN(MAX(per, SQ_MINROWS), gemv_int8_sq_rows_max(M, residual)), (rows + 7) & ~7);
+}
+
+template <int bits, int M, bool c_fp32, bool residual, bool HALF>
+__device__ __forceinline__ void gemv_sq_body(
+    const half* A, const uint16_t* B, void* C, int size_m, int size_k, int size_n,
+    int* counters, float* qsums, int* partials, const half* suh, const half* svh,
+    int rows_per, int grid_width)
 {
     extern __shared__ uint32_t shmem[];
 
@@ -1027,19 +1025,11 @@ void exl3_gemv_int8_sq_kernel
     // to 32 rows, since very short slices inflate ksplit and the epilogue's serial per-slice combine
     int rows_total = size_k >> 4;
     int nb256_total = size_n / 256;
-    int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
-    int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
-    rows_per = MAX(rows_per, SQ_MINROWS);
-    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
-    rows_per = MIN(rows_per, (rows_total + 7) & ~7);
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;
     int pstride = size_n * (residual ? 2 : 1);
 
-    int* counters = locks;
-    float* qsums = (float*) (locks + SQ_COUNTERS_CAP);
-    int* partials = locks + SQ_WS_RESERVED;
 
     // Shared layout: [slice halfs][M x splats (+ M x residual splats)][B stage][epilogue tmp]
     half* sh_ah = (half*) shmem;
@@ -1051,7 +1041,7 @@ void exl3_gemv_int8_sq_kernel
 
     int t = threadIdx.x;
     int prev_slice = -1;
-    for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+    for (int unit = blockIdx.x; unit < units; unit += grid_width)
     {
         int slice = unit / nb256_total;
         int nb256 = unit % nb256_total;
@@ -1084,6 +1074,28 @@ void exl3_gemv_int8_sq_kernel
             if (t == 0) counters[nb256] = 0;
         }
     }
+}
+
+template <int bits, int M, bool c_fp32, bool residual, bool HALF = false>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_gemv_int8_sq_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_m,       // 1 <= size_m <= M
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const half* __restrict__ suh,
+    half* __restrict__ A_had,
+    const half* __restrict__ svh
+)
+{
+    int rows_per = gemv_sq_rows(size_k, size_n, gridDim.x, M, residual);
+    gemv_sq_body<bits, M, c_fp32, residual, HALF>(
+        A, B, C, size_m, size_k, size_n, locks, (float*)(locks + SQ_COUNTERS_CAP),
+        locks + SQ_WS_RESERVED, suh, svh, rows_per, gridDim.x);
 }
 
 // ---------------------------------------------------------------------------------------------------------

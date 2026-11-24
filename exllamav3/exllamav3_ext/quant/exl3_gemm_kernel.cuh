@@ -11,6 +11,7 @@
     #include "exl3_gemm_inner.cuh"
 #endif
 #include "exl3_devctx.cuh"
+#include "exl3_gb10_plan.cuh"
 
 // Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
 // through a device counter; every block is resident (the grid is at most one block per multiprocessor)
@@ -19,6 +20,29 @@
 #else
     #define EXL3_GRID_SYNC() grid.sync()
 #endif
+
+template<EXL3_GEMM_T_ARGS, bool out_had>
+inline __device__ void coop_gemm_slab(
+    const half* A, const uint16_t* B, void* C, int rows, int k, int n, int* locks,
+    const half* scale, int stride, int request_rows, int matrices)
+{
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
+    int slices = gb10_reduction_plan(request_rows, k, n, bits, half_k, c_fp32, cb, matrices).slices;
+    // Higher slice IDs produce the partials consumed by lower IDs. Visit in
+    // descending order so no CTA can wait on a producer in a future wave.
+    for (int slice = slices - 1 - (int) blockIdx.x; slice >= 0; slice -= (int) gridDim.x)
+    {
+        exl3_gemm_kernel_inner
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, out_had>
+        (A, B, C, rows, k, n, locks, scale, stride, slices, slice);
+        __syncthreads();
+    }
+    #else
+    exl3_gemm_kernel_inner
+    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, out_had>
+    (A, B, C, rows, k, n, locks, scale, stride);
+    #endif
+}
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -51,9 +75,9 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 
     while (size_m_ > 0)
     {
-        exl3_gemm_kernel_inner
+        coop_gemm_slab
         <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh);
+        (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh, 0, size_m, 1);
 
         A_ += TILESIZE_M * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
@@ -247,9 +271,9 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             {
                 int lock_offs = blockIdx.z * size_n / 128;
 
-                exl3_gemm_kernel_inner
+                coop_gemm_slab
                 <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j, size_m, MAX(bszm_in, bszm_out));
             }
 
             A_ += TILESIZE_M * size_k;

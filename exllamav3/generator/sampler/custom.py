@@ -276,6 +276,36 @@ class SS_Fused(SS_Base):
         )
         state.state = SS.DONE
 
+    def distribution(self, logits):
+        """Recover the categorical weights from the same cutoff as the fused sampler."""
+        x = logits.float()
+        if self.mode == self.MODE_SAMPLE:
+            return (x * self.inv_temp).softmax(-1)
+        if self.mode == self.MODE_SAMPLE_MINP:
+            threshold = x.amax(-1, keepdim = True) + self.minp_log
+            return (x * self.inv_temp).masked_fill(x < threshold, -torch.inf).softmax(-1)
+
+        state = SamplingState(0, logits.shape[0], logits.shape[1], in_logits = logits)
+        self.run(state)
+        stride = ext.FUSED_SAMPLER_HIST_STRIDE
+        # sampling_fused.cu: FSCtrl follows the two histogram levels. Read the
+        # chosen boundary and partial-bin bias rather than redoing top-P with
+        # different tie semantics.
+        ctrl = self.histograms[logits.device, state.bsz].view(-1, stride)[:, -64:].view(torch.int32)
+        maximum = ctrl[:, :1].view(torch.float32)
+        keep_b, keep_s = ctrl[:, 4:5], ctrl[:, 5:6]
+        part_b, part_s = ctrl[:, 8:9], ctrl[:, 9:10]
+        part_bias = ctrl[:, 10:11].view(torch.float32)
+        buckets = (stride - 64) // 24
+        depth = ((maximum - x) * (buckets / 32 * self.inv_temp_filter)).clamp_max(buckets)
+        bucket = depth.to(torch.int32).clamp_max(buckets - 1)
+        sub = ((depth - bucket) * buckets).to(torch.int32).clamp(0, buckets - 1)
+        keep = (bucket < keep_b) | ((bucket == keep_b) & (sub <= keep_s))
+        if self.filters & self.F_MINP:
+            keep &= x >= maximum + self.minp_log
+        bias = torch.where((bucket == part_b) & (sub == part_s), part_bias, 0.)
+        return (x * self.inv_temp + bias).masked_fill(~keep, -torch.inf).softmax(-1)
+
 
 # Tail patterns that collapse into SS_Fused, matched against the alt()-simplified stack:
 #
@@ -1188,6 +1218,36 @@ class CustomSampler(Sampler):
                     for prep_step in prep_steps:
                         self.steps.append(prep_step())
                 self.steps.append(step)
+
+        self.supports_speculative_sampling = (
+            type(self).forward is CustomSampler.forward
+            and bool(simplified)
+            and type(simplified[-1]) in (SS_Sample, SS_Sample_mn)
+            and all(type(s) in (SS_Temperature, SS_MinP, SS_TopK, SS_TopP)
+                    for s in simplified[:-1])
+            and all(0. < s.temperature < math.inf for s in simplified if type(s) is SS_Temperature)
+            and not (fused_tail is not None and fused_tail.mode == SS_Fused.MODE_GREEDY)
+        )
+
+    def distribution(self, logits: torch.Tensor) -> torch.Tensor:
+        """Expose the probability distribution of a supported, history-free stack."""
+        if not self.supports_speculative_sampling:
+            raise ValueError("Sampler cannot expose a speculative sampling distribution")
+        vocab_size = logits.shape[-1]
+        rows = logits.reshape(-1, vocab_size)
+        if self.fused_only:
+            return self.steps[0].distribution(rows).reshape(logits.shape)
+
+        # Some eager steps mutate their inputs. Keep the target logits for
+        # stream metadata and subsequent verification bookkeeping.
+        state = SamplingState(0, rows.shape[0], vocab_size, in_logits = rows.clone())
+        for step in self.steps[:-1]:
+            step.run(state)
+        SS_Normalize().run(state)
+        probs = state.probs
+        if state.indices is not None:
+            probs = torch.zeros_like(probs).scatter_(-1, state.indices, probs)
+        return probs.reshape(logits.shape)
 
 
     @override

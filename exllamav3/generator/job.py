@@ -11,7 +11,9 @@ import random
 import time
 from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
-from .sampler import Sampler, DefaultSampler
+from .draft_confidence import DraftConfidenceCalibrator
+from .sampler import Sampler, DefaultSampler, CustomSampler
+from ..modules.arch_specific.inkling2_dspark import accept_sampled_probs
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache, partial
@@ -229,6 +231,11 @@ class Job:
         self.rng = rq_state.get("rng")
         if self.rng is None:
             self.rng = random.Random() if seed is None else random.Random(seed)
+        self._dspark_rng = rq_state.get("dspark_rng")
+        self.dspark_rule = None
+        self.dspark_gain = rq_state.get("dspark_gain")
+        self._dspark_calibrator = rq_state.get("dspark_calibrator")
+        self._dspark_rounds = rq_state.get("dspark_rounds", 0)
         self.orig_max_rq_tokens = max_rq_tokens
         self.max_rq_tokens = max_rq_tokens
 
@@ -727,6 +734,71 @@ class Job:
             self.forced_index = 0
         return next_token
 
+    def dspark_sampling_rule(self, hybrid=False):
+        if hybrid:
+            return "token-match (hybrid draft)"
+        if self.filters or self.banned_strings or self.checkpoint is not None:
+            return "token-match (filters or banned strings)"
+        if self.forced_ids is not None or self.new_tokens < self.min_new_tokens:
+            return "token-match (token constraints)"
+        if not isinstance(self.sampler, CustomSampler) or not self.sampler.supports_speculative_sampling:
+            return "token-match (greedy or unsupported sampler)"
+        return "rejection"
+
+    def dspark_rng(self, device):
+        if self._dspark_rng is None:
+            self._dspark_rng = torch.Generator(device=device).manual_seed(self.rng.getrandbits(64))
+        return self._dspark_rng
+
+    def dspark_distribution(self, logits):
+        return self.sampler.distribution(logits[..., :self.generator.tokenizer.actual_vocab_size])
+
+    def dspark_draft_window(self, window, confidence):
+        if self._dspark_calibrator is None:
+            self._dspark_calibrator = DraftConfidenceCalibrator(confidence)
+        # Later positions are censored by earlier rejections. Periodically try
+        # the full window so a cut can recover as the workload changes.
+        self._dspark_rounds += 1
+        if self._dspark_rounds % 16 == 0:
+            return window
+        reach = 1.
+        for depth in range(window - 1):
+            reach *= self._dspark_calibrator.estimate(depth)
+            if reach < confidence:
+                return depth + 1
+        return window
+
+    def record_dspark_acceptance(self, window, tested, accepted):
+        if self._dspark_calibrator is not None:
+            self._dspark_calibrator.decay_step()
+            for depth in range(min(window, tested, accepted + 1)):
+                self._dspark_calibrator.add_label(depth, depth < accepted)
+
+    def sample_dspark(self, logits, proposals, proposal_probs):
+        self._check_sample_logits(logits)
+        target_probs = self.dspark_distribution(logits[0])
+        logits[..., self.generator.tokenizer.actual_vocab_size:] = -float("inf")
+        q = proposal_probs[0]
+        if q.shape[-1] < target_probs.shape[-1]:
+            q = torch.nn.functional.pad(q, (0, target_probs.shape[-1] - q.shape[-1]))
+        return accept_sampled_probs(target_probs, proposals[0], q, generator=self.dspark_rng(logits.device))
+
+    def _check_sample_logits(self, logits):
+        # Check only the job's first token. The error check synchronizes.
+        if self.new_tokens >= 1:
+            return
+        # The Inkling head already masks padded rows with negative infinity.
+        finite = torch.isfinite(logits)
+        real = self.generator.tokenizer.actual_vocab_size
+        finite[..., real:] |= torch.isneginf(logits[..., real:])
+        if not bool(finite.all()):
+            n_bad = int((~finite).sum())
+            raise NonFiniteLogits(
+                f"Job {self.identifier!r} (serial {self.serial_number}) produced {n_bad} non-finite "
+                f"logits at step {self.new_tokens} (tensor {tuple(logits.shape)} on {logits.device}). "
+                f"This is a kernel bug, not bad sampling settings. A/B the fused decode paths to "
+                f"bisect: EXL3_BC_MLA=0, EXL3_BC_GDN=0, EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0."
+            )
 
     def receive_logits(
         self,
@@ -738,18 +810,10 @@ class Job:
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
 
-        # Fail fast on NaN/Inf logits: sampling them yields a fixed garbage token (argmax over
-        # NaN is id 0) that can loop, which hides the fault. Checked on the job's first sampled
-        # token only, which costs one sync per job
-        if self.new_tokens < 1:
-            if not bool(torch.isfinite(logits).all()):
-                n_bad = int((~torch.isfinite(logits)).sum())
-                raise NonFiniteLogits(
-                    f"Job {self.identifier!r} (serial {self.serial_number}) produced {n_bad} non-finite "
-                    f"logits at step {self.new_tokens} (tensor {tuple(logits.shape)} on {logits.device}). "
-                    f"This is a kernel bug, not bad sampling settings. A/B the fused decode paths to "
-                    f"bisect: EXL3_BC_MLA=0, EXL3_BC_GDN=0, EXL3_BC_ATTN=0, EXL3_BC_DSA=0, EXL3_GRAPHS=0."
-                )
+        self._check_sample_logits(logits)
+
+        # Never sample padded output columns, including with custom samplers.
+        logits[..., self.generator.tokenizer.actual_vocab_size:] = -float("inf")
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
@@ -764,13 +828,17 @@ class Job:
                 logit_mask = self.device_logit_mask
             )
 
+        return self.describe_sample(logits, next_token)
+
+
+    def describe_sample(self, logits, next_token):
         next_prob, next_k_tokens, next_k_probs = None, None, None
 
         if self.return_probs or self.return_top_tokens > 0:
             probs = torch.softmax(logits.float(), dim = -1)
 
             if self.return_probs:
-                next_prob = torch.gather(probs.squeeze(0), dim = 1, index = next_token)
+                next_prob = torch.gather(probs.squeeze(0), dim = 1, index = next_token.to(logits.device))
 
             if self.return_top_tokens > 0:
                 sorted_probs, sorted_indices = torch.sort(probs, dim = -1, descending = True)
@@ -1218,6 +1286,10 @@ class Job:
 
         rq_state = {
             "rng": self.rng,
+            "dspark_rng": self._dspark_rng,
+            "dspark_gain": self.dspark_gain,
+            "dspark_calibrator": self._dspark_calibrator,
+            "dspark_rounds": self._dspark_rounds,
             "stop_strings": self.stop_strings,
             "stop_tokens": self.stop_tokens,
             "stop_strings_utf32_buffer": self.stop_strings_utf32_buffer,
@@ -1604,15 +1676,19 @@ class Job:
                 }
                 gen = self.generator
                 dm = gen.draft_model
-                if dm:
+                if gen.dspark_draft:
+                    params["inkling_tap_cache"] = gen.draft_cache.layers[(0, 0)]
+                    params["_inkling_prompt_chunk"] = True
+                elif dm:
                     params.update(dm.draft_verifier_params)
                 # MTP needs the target's post-final-norm state for every prompt token. Normal prefill stops at the
                 # last cache-writing layer, before final norm. (A drafter fed the last decoder layer's output takes
                 # the regular prefill, which runs through that layer)
-                to_output = gen.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache"))
+                to_output = gen.dspark_draft or (gen.mtp_draft and not dm.caps.get("draft_uses_target_cache"))
                 if to_output:
                     params["last_tokens_only"] = 1
-                then = partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start) if dm else None
+                then = (partial(self.update_draft_from_prefill, seq, prefill_ids, prefill_start)
+                        if dm and not gen.dspark_draft else None)
                 if gen.pipeline is not None and len(self.sequences) == 1:
                     gen.pipeline.prefill(prefill_ids, params, self, to_output, then)
                 else:
@@ -1986,7 +2062,7 @@ class Job:
 
     def free_recurrent_state(self):
         if self.recurrent_state is not None:
-            self.recurrent_state.free()
+            self.generator.release_recurrent_state(self.recurrent_state)
             self.recurrent_state = None
 
 

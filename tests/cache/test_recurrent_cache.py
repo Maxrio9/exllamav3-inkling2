@@ -82,6 +82,19 @@ def test_release_drops_idle_buffers_only():
     held.fill_(1.0)                       # the buffer still in use is untouched
 
 
+@pytest.mark.nogpu
+def test_populated_checkpoint_preserves_strided_source_and_reuses_storage():
+    source = torch.arange(8193 * 3, dtype = torch.float32).reshape(-1, 3).T
+    saved = host_copy(source, populate = True)
+    assert torch.equal(saved, source)
+    host_pool.give(saved)
+
+    source.neg_()
+    reused = host_copy(source, populate = True)
+    assert reused is saved
+    assert torch.equal(reused, source)
+
+
 def test_host_copy_matches_cpu_for_strided_sources(device):
     before = host_pool.allocated
     state = torch.randn(4, 6, 16, 16, device = device)

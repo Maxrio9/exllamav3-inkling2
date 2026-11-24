@@ -5,7 +5,16 @@
 
 #include "coop_autotune.cuh"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -24,7 +33,7 @@
 namespace
 {
 
-constexpr uint64_t COOP_AUTOTUNE_VERSION = 4;
+constexpr uint64_t COOP_AUTOTUNE_VERSION = 5;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 
@@ -57,12 +66,14 @@ struct DiskCacheRecordV1
     uint32_t reserved1;
 };
 
-std::map<uint64_t, CoopAutotuneLaunch> launch_cache;
+using LaunchKey = std::pair<int, uint64_t>;
+std::map<LaunchKey, CoopAutotuneLaunch> launch_cache;
+std::mutex launch_mutex;
+std::mutex attr_mutex;
 
 std::set<std::tuple<int, void*, size_t>> attr_set;
 
 std::mutex disk_mutex;
-bool disk_cache_loaded = false;
 std::map<uint64_t, DiskCacheRecordV1> disk_cache;
 
 // EXL3_DEBUG_AUTOTUNE: print every probe/measurement launch and synchronize after it, so a launch that
@@ -73,11 +84,35 @@ static bool debug_autotune()
     return v;
 }
 
-uint64_t salt_hash(uint64_t hash)
+// Cache discovery per host thread and device. In particular, avoid reading
+// the Linux driver build or querying the runtime during graph replay setup.
+LaunchKey launch_key(uint64_t shape)
 {
-    hash ^= COOP_AUTOTUNE_VERSION;
-    hash *= 1099511628211ull;
-    return hash;
+    int device;
+    cuda_check(cudaGetDevice(&device));
+    thread_local std::map<int, uint64_t> device_keys;
+    auto it = device_keys.find(device);
+    if (it == device_keys.end())
+    {
+        uint64_t h = COOP_AUTOTUNE_VERSION;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        const auto* prop = at::cuda::getDeviceProperties(device);
+        for (const char* p = prop->name; *p; ++p) mix((unsigned char)*p);
+        mix(prop->major);
+        mix(prop->minor);
+        int driver;
+        cuda_check(cudaDriverGetVersion(&driver));
+        mix(driver);
+        #if defined(__linux__) && !defined(USE_ROCM)
+        // The CUDA API compatibility version stays constant across driver patches.
+        std::string build;
+        std::ifstream version("/proc/driver/nvidia/version");
+        if (std::getline(version, build))
+            for (unsigned char ch : build) mix(ch);
+        #endif
+        it = device_keys.emplace(device, h).first;
+    }
+    return {device, (shape ^ it->second) * 1099511628211ull};
 }
 
 std::filesystem::path disk_cache_path()
@@ -126,6 +161,53 @@ std::filesystem::path disk_cache_path()
     #endif
 }
 
+// Serialize a first tuning run with other processes sharing this file.
+// The OS releases the lock on exit, including an interrupted calibration.
+class PlanFileLock
+{
+    #ifdef _WIN32
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    OVERLAPPED overlap{};
+    #else
+    int fd = -1;
+    #endif
+public:
+    PlanFileLock(const PlanFileLock&) = delete;
+    PlanFileLock& operator=(const PlanFileLock&) = delete;
+    bool locked = false;
+    explicit PlanFileLock(std::filesystem::path path)
+    {
+        if (path.empty()) return;
+        std::error_code ec;
+        if (!path.parent_path().empty())
+            std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) return;
+        path += ".lock";
+        #ifdef _WIN32
+        handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
+        if (handle != INVALID_HANDLE_VALUE)
+            locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlap);
+        #else
+        fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+        if (fd >= 0)
+        {
+            int rc;
+            do { rc = flock(fd, LOCK_EX); } while (rc == -1 && errno == EINTR);
+            locked = rc == 0;
+        }
+        #endif
+    }
+    ~PlanFileLock()
+    {
+        #ifdef _WIN32
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        #else
+        if (fd >= 0) close(fd);
+        #endif
+    }
+};
+
 bool read_disk_header(std::ifstream& in)
 {
     DiskCacheHeader header;
@@ -133,39 +215,36 @@ bool read_disk_header(std::ifstream& in)
     if (!in) return false;
     if (std::memcmp(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic)) != 0) return false;
     if (header.format != DISK_CACHE_FORMAT) return false;
-    if (header.record_size < sizeof(DiskCacheRecordV1)) return false;
+    if (header.record_size != sizeof(DiskCacheRecordV1)) return false;
     return true;
 }
 
-void load_disk_cache_locked()
+bool load_disk_cache_locked()
 {
-    if (disk_cache_loaded) return;
-    disk_cache_loaded = true;
+    disk_cache.clear();
 
     std::filesystem::path path = disk_cache_path();
-    if (path.empty() || !std::filesystem::exists(path)) return;
+    if (path.empty()) return false;
 
     std::ifstream in(path, std::ios::binary);
-    if (!in || !read_disk_header(in)) return;
-
-    DiskCacheHeader header;
-    in.seekg(0, std::ios::beg);
-    in.read((char*) &header, sizeof(header));
-    if (!in) return;
-
-    std::vector<char> record_bytes(header.record_size);
-    while (in.read(record_bytes.data(), header.record_size))
+    if (!in)
     {
-        // An embedded header (two processes appended their first record concurrently): rewind to
-        // just after it and keep reading records from there
-        if (header.record_size >= sizeof(DiskCacheHeader) &&
-            std::memcmp(record_bytes.data(), DISK_CACHE_MAGIC, sizeof(DISK_CACHE_MAGIC)) == 0)
+        std::error_code ec;
+        return !std::filesystem::exists(path, ec) && !ec;
+    }
+    if (in.peek() == std::ifstream::traits_type::eof()) return in.eof();
+    // Preserve files with an unknown format, including newer cache revisions.
+    if (!read_disk_header(in)) return false;
+
+    DiskCacheRecordV1 record;
+    while (in.read((char*) &record, sizeof(record)))
+    {
+        // Legacy append-only files could contain a second writer's header.
+        if (std::memcmp(&record, DISK_CACHE_MAGIC, sizeof(DISK_CACHE_MAGIC)) == 0)
         {
-            in.seekg(-(std::streamoff)(header.record_size - sizeof(DiskCacheHeader)), std::ios::cur);
+            in.seekg(-(std::streamoff)(sizeof(record) - sizeof(DiskCacheHeader)), std::ios::cur);
             continue;
         }
-        DiskCacheRecordV1 record;
-        std::memcpy(&record, record_bytes.data(), sizeof(record));
         disk_cache[record.hash] = record;
     }
 
@@ -177,37 +256,34 @@ void load_disk_cache_locked()
         disk_cache.size()
     );
     #endif
+    return true;
 }
 
-void append_disk_cache_locked(const DiskCacheRecordV1& record)
+// Publish a complete cache. A stopped writer leaves the previous set of
+// plans readable. The lock also protects the temporary name.
+bool write_disk_cache_locked()
 {
-    std::filesystem::path path = disk_cache_path();
-    if (path.empty()) return;
-
+    auto path = disk_cache_path();
+    auto tmp = path;
+    tmp += ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    DiskCacheHeader header{};
+    std::memcpy(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic));
+    header.format = DISK_CACHE_FORMAT;
+    header.record_size = sizeof(DiskCacheRecordV1);
+    out.write((const char*) &header, sizeof(header));
+    for (const auto& entry : disk_cache)
+        out.write((const char*) &entry.second, sizeof(entry.second));
+    out.close();
+    if (!out) return false;
+    #ifdef _WIN32
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    #else
     std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    if (ec) return;
-
-    bool write_header = !std::filesystem::exists(path) || std::filesystem::file_size(path, ec) == 0;
-    std::ofstream out(path, std::ios::binary | std::ios::app);
-    if (!out) return;
-
-    // Header and first record go out in one write so a concurrent first writer can never split them;
-    // if two processes both see an empty file, the second header lands between records and the
-    // reader skips it (load_disk_cache_locked)
-    if (write_header)
-    {
-        DiskCacheHeader header;
-        std::memcpy(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic));
-        header.format = DISK_CACHE_FORMAT;
-        header.record_size = sizeof(DiskCacheRecordV1);
-        char buf[sizeof(header) + sizeof(record)];
-        std::memcpy(buf, &header, sizeof(header));
-        std::memcpy(buf + sizeof(header), &record, sizeof(record));
-        out.write(buf, sizeof(buf));
-    }
-    else
-        out.write((const char*) &record, sizeof(record));
+    std::filesystem::rename(tmp, path, ec);
+    return !ec;
+    #endif
 }
 
 bool launch_from_disk_cache
@@ -217,9 +293,6 @@ bool launch_from_disk_cache
     CoopAutotuneLaunch* launch_config
 )
 {
-    std::lock_guard<std::mutex> lock(disk_mutex);
-    load_disk_cache_locked();
-
     auto lookup = disk_cache.find(hash);
     if (lookup == disk_cache.end()) return false;
 
@@ -283,7 +356,7 @@ bool launch_from_disk_cache
     return false;
 }
 
-void store_disk_cache(uint64_t hash, const CoopAutotuneLaunch& launch_config)
+bool store_disk_cache(uint64_t hash, const CoopAutotuneLaunch& launch_config)
 {
     DiskCacheRecordV1 record =
     {
@@ -296,10 +369,7 @@ void store_disk_cache(uint64_t hash, const CoopAutotuneLaunch& launch_config)
         0
     };
 
-    std::lock_guard<std::mutex> lock(disk_mutex);
-    load_disk_cache_locked();
     disk_cache[hash] = record;
-    append_disk_cache_locked(record);
 
     #ifdef CACHEDEBUG
     printf
@@ -312,6 +382,7 @@ void store_disk_cache(uint64_t hash, const CoopAutotuneLaunch& launch_config)
         record.concurrency
     );
     #endif
+    return write_disk_cache_locked();
 }
 
 void set_kernel_attr_once(void* kernel, size_t smem)
@@ -319,6 +390,7 @@ void set_kernel_attr_once(void* kernel, size_t smem)
     int device;
     cuda_check(cudaGetDevice(&device));
 
+    std::lock_guard<std::mutex> lock(attr_mutex);
     auto key = std::make_tuple(device, kernel, smem);
     if (attr_set.find(key) != attr_set.end()) return;
 
@@ -622,10 +694,11 @@ bool CoopKernelAutotuner::launch_locked
 )
 {
     CoopAutotuneLaunch launch_config;
-    hash = salt_hash(hash);
+    auto key = launch_key(hash);
 
     {
-        auto lookup = launch_cache.find(hash);
+        std::lock_guard<std::mutex> lock(launch_mutex);
+        auto lookup = launch_cache.find(key);
         if (lookup == launch_cache.end()) return false;
         launch_config = lookup->second;
     }
@@ -656,33 +729,28 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
 )
 {
     CoopAutotuneLaunch launch_config;
-    uint64_t salted_hash = salt_hash(hash);
-
-    if (launch_locked(hash, kernel_args, smem, stream, &launch_config))
-        return launch_config;
-
-    if (launch_from_disk_cache(salted_hash, candidates, &launch_config))
+    auto key = launch_key(hash);
     {
-        launch_cache[salted_hash] = launch_config;
-        set_kernel_attr_once(launch_config.kernel, smem);
-        cuda_check(EXL3_COOP_LAUNCH
-        (
-            launch_config.kernel,
-            dim3(launch_config.num_sms, 1, launch_config.concurrency),
-            launch_config.block_dim,
-            kernel_args,
-            smem,
-            stream
-        ));
-        return launch_config;
-    }
+        std::lock_guard<std::mutex> cold_lock(disk_mutex);
+        if (launch_locked(hash, kernel_args, smem, stream, &launch_config))
+            return launch_config;
 
-    {
-        launch_config = tune(candidates, kernel_args, smem, stream, numel_B);
-        auto inserted = launch_cache.emplace(salted_hash, launch_config);
-        launch_config = inserted.first->second;
+        PlanFileLock file_lock(disk_cache_path());
+        bool usable_file = load_disk_cache_locked();
+        bool hit = launch_from_disk_cache(key.second, candidates, &launch_config);
+        if (!hit)
+        {
+            launch_config = tune(candidates, kernel_args, smem, stream, numel_B);
+            if (!usable_file || !file_lock.locked || !store_disk_cache(key.second, launch_config))
+                TORCH_WARN_ONCE("Could not persist cooperative GEMM tuning at ", disk_cache_path().string());
+        }
+        if (debug_autotune())
+            fprintf(stderr, "[autotune %s] key=%016llx shape=%d sms=%d concurrent=%d\n",
+                    hit ? "hit" : "miss", (unsigned long long) key.second, launch_config.tag,
+                    launch_config.num_sms, launch_config.concurrency);
+        std::lock_guard<std::mutex> lock(launch_mutex);
+        launch_cache.emplace(key, launch_config);
     }
-    store_disk_cache(salted_hash, launch_config);
 
     set_kernel_attr_once(launch_config.kernel, smem);
     cuda_check(EXL3_COOP_LAUNCH

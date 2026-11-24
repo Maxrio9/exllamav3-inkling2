@@ -2,6 +2,7 @@ from collections import OrderedDict
 from ..constants import PAGE_SIZE
 import torch
 from ..util.memory import malloc_trim
+import mmap
 import threading
 
 
@@ -36,7 +37,7 @@ class HostPool:
         # The workers of a pipelined prefill take buffers for their devices' layers
         self.lock = threading.Lock()
 
-    def take(self, shape, dtype):
+    def take(self, shape, dtype, *, populate=False):
         key = (tuple(shape), dtype)
         with self.lock:
             lst = self.free.get(key)
@@ -44,7 +45,14 @@ class HostPool:
                 self.reused += 1
                 return lst.pop()
             self.allocated += 1
-        return torch.empty(shape, dtype = dtype)
+        dst = torch.empty(shape, dtype = dtype)
+        if populate and dst.numel():
+            # On GB10, a D2H copy can fault in anonymous host pages one at
+            # a time. Establish the mappings on the CPU only on first use.
+            data = dst.reshape(-1).view(torch.uint8)
+            data[::mmap.PAGESIZE].zero_()
+            data[-1].zero_()  # A partially covered final page may follow the last stride.
+        return dst
 
     def give(self, obj):
         """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
@@ -74,9 +82,9 @@ def mp_host_pool_release(local_context: dict):
     host_pool.release()
 
 
-def host_copy(src: torch.Tensor) -> torch.Tensor:
+def host_copy(src: torch.Tensor, *, populate=False) -> torch.Tensor:
     """Copy a device tensor (any strides) into a pooled host buffer; the stash-side replacement for .cpu()"""
-    dst = host_pool.take(src.shape, src.dtype)
+    dst = host_pool.take(src.shape, src.dtype, populate=populate)
     dst.copy_(src)
     return dst
 

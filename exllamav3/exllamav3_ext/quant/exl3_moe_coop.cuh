@@ -25,6 +25,14 @@ struct MoeCoopParams
     int x_stride;
     const int64_t* sel;         // (bsz, topk) global expert indices
     const half* rw;             // (bsz, topk) routing weights
+    // Inkling's fused gate/up matrix uses the mul1 codebook, a per-expert
+    // half-bit rate for each matrix, and full precision router weights.
+    const int* slot_tiles;      // per-expert slot IDs, -1 padding; 16 per prefill tile (8 for legacy callers)
+    int num_tiles;
+    const int64_t* gu_k2;
+    const int64_t* down_k2;
+    const float* rw_float;
+    float up_cap;
     int bsz;
     int topk;
     int H;                      // x width (the experts' input width before padding)
@@ -157,3 +165,8 @@ inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t
 {
     return slots_max * (I / 128) + bsz_max * (Ho / 128) + 2 + (slots_max + 1) + slots_max;
 }
+
+// tables: (2 projections, 4 fields, experts), fields trellis/suh/svh/2*K.
+void inkling_moe_coop(const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+                      const at::Tensor& tables, const c10::optional<at::Tensor>& tiles, double gate_cap, double up_cap,
+                      at::Tensor gu, at::Tensor activation, at::Tensor down, at::Tensor ctr, at::Tensor out);

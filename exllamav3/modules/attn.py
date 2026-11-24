@@ -82,17 +82,17 @@ def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor
 # device copies so they aren't rebuilt and re-uploaded every forward pass
 _block_tables = {}
 
-def _get_block_table(cache_bsz: int, pages_per_seq: int) -> torch.Tensor:
-    key = (cache_bsz, pages_per_seq)
+def _get_block_table(cache_bsz: int, pages_per_seq: int, device=None) -> torch.Tensor:
+    key = (cache_bsz, pages_per_seq, device)
     bt = _block_tables.get(key)
     if bt is None:
-        bt = torch.arange(cache_bsz * pages_per_seq, dtype = torch.int32).view(cache_bsz, pages_per_seq)
+        bt = torch.arange(cache_bsz * pages_per_seq, dtype = torch.int32, device = device).view(cache_bsz, pages_per_seq)
         bt._static_dev_cache = True
         _block_tables[key] = bt
     return bt
 
 
-def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+def prepare_flash_attn(input_ids: torch.Tensor, params: dict, metadata_device=None) -> torch.Tensor:
     bsz, seq_len = input_ids.shape
 
     if "batch_shape" in params:
@@ -108,9 +108,9 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
         cache_bsz = min(bsz, cache_bsz)
-        block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE, metadata_device)
         if past_len is not None:
-            cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
+            cache_seqlens = torch.full((bsz,), past_len, dtype = torch.int32, device = metadata_device)
             if position is None: position = past_len
         else:
             if positions is None and position_ids is None: positions = cache_seqlens
@@ -133,14 +133,14 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     return input_ids
 
 
-def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+def prepare_for_attn(input_ids: torch.Tensor, params: dict, metadata_device=None) -> torch.Tensor:
     """
     Add attn parameters to state
     """
     attn_mode = params.get("attn_mode", "flash_attn_nc")
     match attn_mode:
         case "flash_attn":
-            return prepare_flash_attn(input_ids, params)
+            return prepare_flash_attn(input_ids, params, metadata_device)
         case "flash_attn_nc":
             return prepare_flash_attn_nc(input_ids, params)
         case _:

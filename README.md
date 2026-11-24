@@ -232,6 +232,7 @@ python examples/chat.py -h
 | **Qwen 3.5**                                      | `Qwen3_5ForConditionalGeneration`                                             |     ✓     |                       |
 | **Qwen 3.5 MoE**                                  | `Qwen3_5MoeForConditionalGeneration`                                          |     ✓     |                       |
 | **Qwen 3.8-Flash-Next**                           | `Qwen4ExpForConditionalGeneration`                                            |     ✓     |                       |
+| **SenseNova Loop** (text only)                    | `SenseNovaLoopForConditionalGeneration`                                       |     ✓     |                       |
 | **Seed-OSS**                                      | `SeedOssForCausalLM`                                                          |            |                       |
 | **SmolLM**                                        | `SmolLM3ForCausalLM`                                                          |            |                       |
 | **SolarOpen**                                     | `SolarOpenForCausalLM`                                                        |            |                       |
@@ -310,3 +311,16 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 </p>
 
 
+
+
+## Inkling 2 Mini
+
+This fork supports text generation for Inkling 2 Mini EXL3 with FP16 or Q8 KV cache, one request at a time. Vision is not qualified. Q8 cannot be combined with DSpark.
+
+Install PyTorch and a matching CUDA toolkit, then build for your GPU (choose `12.0` for sm_120, `12.1` for sm_121, or `8.6` for sm_86):
+
+```sh
+TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation .
+```
+
+Check out TabbyAPI at `47281587fafbd69e50aaf77c7626f390811126b6`, apply `patches/tabby-inkling2.patch`, and use a [recipe](https://github.com/Maxrio9/inkling-2-mini-exl3-recipes) to configure and launch it. [Model](https://huggingface.co/Maxrio/Inkling-2-Mini-exl3). This fork derives from ExLlamaV3 upstream `627c8710ab69bd8a581018489a177c64746b2688` and retains its MIT licence and attribution.

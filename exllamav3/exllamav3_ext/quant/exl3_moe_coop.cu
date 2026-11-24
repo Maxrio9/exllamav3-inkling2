@@ -16,6 +16,9 @@
 #include "bits_k.cuh"
 #define EXL3_MOE_COOP_DEFINE_ROT
 #include "exl3_moe_coop_kernel.cuh"
+#ifndef USE_ROCM
+#include "exl3_moe_coop_inkling.cuh"
+#endif
 
 // Output rows of a launch without routed slots (top-k 0): the empty sum, plus the shared-expert term
 // when there is one. One warp per (row, 128-column chunk)
@@ -147,17 +150,30 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         return;
     }
     const int nproj = p.gated ? 2 : 1;
-    p.a_global = p.bsz > 1;
+    p.a_global = p.bsz > 1 && !p.gu_k2;
 
-    const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
-    const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    const bool wide_a = !p.gu_k2 && moe_coop_pick_wide(p.Hi / 16, slots, device);
+    const bool wide_b = !p.gu_k2 && moe_coop_pick_wide(p.I / 16, slots, device);
+    using namespace exl3_moe_coop_ns;
+    MoeCoopKernel ka, kb;
+    if (p.gu_k2)
+    {
+        // Use per-slot tiles for small verification blocks. The CTA rotates
+        // its input locally, so the packed path always takes two launches.
+        ka = {(void*)exl3_moe_coop_a_kernel<0, 2, false>, smem_a_bytes<0>(p.Hi * (p.slot_tiles ? ROWS : 1))};
+        kb = {(void*)exl3_moe_coop_b_kernel<0, 2, false>, smem_b_bytes<0>()};
+    }
+    else
+    {
+        ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+        kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    }
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
 
-    const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
-    const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
+    const int runs = p.slot_tiles ? p.num_tiles : slots;
+    const int base_a = runs * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
+    const int base_b = runs * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
     const int max_split = std::max(1, p.slots_max / slots);
     p.ksplit_a = moe_coop_pick_ksplit(base_a, p.Hi / 16, max_split, device);
     p.ksplit_b = moe_coop_pick_ksplit(base_b, p.I / 16, max_split, device);
@@ -379,4 +395,231 @@ void exl3_moe_coop
     p.min_expert = min_expert;
     p.max_expert = max_expert;
     exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
+}
+
+namespace exl3_moe_coop_ns {
+
+// Packed gate/up shares an input rotation. Store it once per selected slot in
+// the down scratch, whose first consumer is after the gate/up GEMM completes.
+__global__ void inkling_rotate(const MoeCoopParams p)
+{
+    __shared__ int16_t order[MAX_SLOTS], experts[MAX_SLOTS];
+    __shared__ int scan[WK], result[4];
+    if (p.runs && !p.slot_tiles && blockIdx.x == 0)
+        build_runs(p, order, experts, scan, result);
+    const int item = blockIdx.x * WK + threadIdx.x / 32;
+    const int chunks = p.H / 128;
+    const int slot = item / chunks;
+    if (slot >= p.slots_max) return;
+    rotate_chunk(p, slot / 8, (const half*) p.g_suh[p.sel[slot]], item % chunks,
+                 p.had_g + (size_t) slot * p.H, threadIdx.x % 32);
+}
+
+// Use the same k splits, fragment folding and reduction order as the decode
+// kernel. A stream boundary replaces the per-slot completion counters.
+template <bool DOWN, int TILE_ROWS>
+__global__ __launch_bounds__(THREADS)
+void inkling_grouped_gemm(const MoeCoopParams p)
+{
+    __shared__ int slots[TILE_ROWS];
+    __shared__ float red[WK * TILE_ROWS * COLS];
+    __shared__ uint32_t stage[WK * STAGE_WORDS];
+    const int run = blockIdx.y;
+    int nrows;
+    if constexpr (TILE_ROWS == 16)
+    {
+        const int* tile = p.slot_tiles + run * TILE_ROWS;
+        if (threadIdx.x < TILE_ROWS) slots[threadIdx.x] = tile[threadIdx.x];
+        __syncthreads();
+        if (slots[0] < 0) return;
+        nrows = __popc(__ballot_sync(0xffffffffu, (threadIdx.x % 32 < TILE_ROWS) &&
+                                    slots[threadIdx.x % TILE_ROWS] >= 0));
+    }
+    else if (!read_run(p, run, slots, nrows, nullptr)) return;
+    const int expert = p.sel[slots[0]];
+    const int group = blockIdx.x;
+    const int cols = DOWN ? p.H : p.I;
+    const int inner = DOWN ? p.I : p.H;
+    const auto* rates = DOWN ? p.down_k2 : p.gu_k2;
+    auto* packed = (const uint32_t*) (DOWN ? p.d_trellis : p.g_trellis)[expert];
+    const bool up = !DOWN && blockIdx.z == 1;
+    if (up) packed += (p.I / 16) * (4 * rates[expert]);
+    auto* input = (const half2*) (DOWN ? p.act_out : p.had_g);
+    void* output = DOWN ? p.d_out : (up ? p.gu_u : p.gu_g);
+    routed_tile<0, 2, false, false, TILE_ROWS>(
+        rates, expert, packed, input, (size_t) inner / 2, slots, nrows, output, (size_t) cols,
+        true, 0, inner / 16, (DOWN ? cols : 2 * cols) / 16, group, red, stage);
+}
+
+__device__ __forceinline__ float4 inkling_output_chunk(
+    const float* raw, const half* scale, int lane)
+{
+    float4 v = *reinterpret_cast<const float4*>(raw);
+    had128(v.x, v.y, v.z, v.w, lane);
+    scale_h4(scale, v.x, v.y, v.z, v.w);
+    return v;
+}
+
+__global__ void inkling_activate(const MoeCoopParams p)
+{
+    const int item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int slot = item / (p.I / 128);
+    if (slot >= p.slots_max) return;
+    const int lane = threadIdx.x % 32, expert = p.sel[slot];
+    const int col = item % (p.I / 128) * 128 + lane * 4;
+    const int off = slot * p.I + col;
+    auto* svh = (const half*) p.g_svh[expert] + col;
+    float4 g = inkling_output_chunk((const float*) p.gu_g + off, svh, lane);
+    float4 u = inkling_output_chunk((const float*) p.gu_u + off, svh + p.I, lane);
+    float a = inkling_swiglu(g.x, u.x, p.act_limit, p.up_cap);
+    float b = inkling_swiglu(g.y, u.y, p.act_limit, p.up_cap);
+    float c = inkling_swiglu(g.z, u.z, p.act_limit, p.up_cap);
+    float d = inkling_swiglu(g.w, u.w, p.act_limit, p.up_cap);
+    scale_h4((const half*) p.d_suh[expert] + col, a, b, c, d);
+    had128(a, b, c, d, lane);
+    store_h4(p.act_out + off, a, b, c, d);
+}
+
+__global__ void inkling_reduce(const MoeCoopParams p)
+{
+    __shared__ float4 weighted[8][32];
+    const int lane = threadIdx.x % 32, pick = threadIdx.x / 32;
+    const int slot = blockIdx.y * 8 + pick, col = blockIdx.x * 128 + lane * 4;
+    float4 v = inkling_output_chunk(p.d_out + slot * p.H + col,
+                                    (const half*) p.d_svh[p.sel[slot]] + col, lane);
+    const float w = p.rw_float[slot];
+    weighted[pick][lane] = make_float4(w * __half2float(__float2half_rn(v.x)),
+                                       w * __half2float(__float2half_rn(v.y)),
+                                       w * __half2float(__float2half_rn(v.z)),
+                                       w * __half2float(__float2half_rn(v.w)));
+    __syncthreads();
+    if (!pick)
+    {
+        float4 sum = {};
+        #pragma unroll
+        for (int k = 0; k < 8; ++k)
+        {
+            float4 r = weighted[k][lane];
+            sum.x += r.x; sum.y += r.y; sum.z += r.z; sum.w += r.w;
+        }
+        *reinterpret_cast<float4*>(p.out + blockIdx.y * p.H + col) = sum;
+    }
+}
+
+template <int TILE_ROWS>
+static void inkling_batch(MoeCoopParams p, cudaStream_t stream)
+{
+    const int tiles = p.slot_tiles ? p.num_tiles : p.slots_max;
+    p.a_global = true;
+    p.had_g = reinterpret_cast<half*>(p.d_out);
+    inkling_rotate<<<CEIL_DIVIDE(p.slots_max * (p.H / 128), WK), THREADS, 0, stream>>>(p);
+    inkling_grouped_gemm<false, TILE_ROWS><<<dim3(p.I / COLS, tiles, 2), THREADS, 0, stream>>>(p);
+    inkling_activate<<<CEIL_DIVIDE(p.slots_max * (p.I / 128), 8), 256, 0, stream>>>(p);
+    inkling_grouped_gemm<true, TILE_ROWS><<<dim3(p.H / COLS, tiles), THREADS, 0, stream>>>(p);
+    inkling_reduce<<<dim3(p.H / 128, p.bsz), 256, 0, stream>>>(p);
+    cuda_check(cudaPeekAtLastError());
+}
+
+#ifndef USE_ROCM
+template <bool SINGLE>
+static void inkling_decode(MoeCoopParams p, cudaStream_t stream)
+{
+    p.a_global = true;
+    p.had_g = reinterpret_cast<half*>(p.d_out);
+    inkling_rotate<<<CEIL_DIVIDE(p.slots_max * (p.H / 128), WK), THREADS, 0, stream>>>(p);
+    const dim3 grid(INKLING_HIDDEN / 16, p.slots_max);
+    inkling_decode_gemm<false, SINGLE><<<grid, INKLING_DECODE_WARPS * 32, 0, stream>>>(p);
+    inkling_activate<<<CEIL_DIVIDE(p.slots_max * (p.I / 128), 8), 256, 0, stream>>>(p);
+    inkling_decode_gemm<true, SINGLE><<<grid, INKLING_DECODE_WARPS * 32, 0, stream>>>(p);
+    inkling_reduce<<<dim3(p.H / 128, p.bsz), 256, 0, stream>>>(p);
+    cuda_check(cudaPeekAtLastError());
+}
+#endif
+} // namespace exl3_moe_coop_ns
+
+void inkling_moe_coop(const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+                      const at::Tensor& tables, const c10::optional<at::Tensor>& tiles, double gate_cap, double up_cap,
+                      at::Tensor gu, at::Tensor activation, at::Tensor down, at::Tensor ctr, at::Tensor out)
+{
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) > 0 && x.size(0) <= (tiles ? 2048 : 8), "Inkling MoE input");
+    for (const auto* t : {&sel, &rw, &tables, &x})
+        TORCH_CHECK(t->device() == x.device() && t->is_contiguous(), "Inkling MoE input device/stride");
+    for (const auto* t : {&gu, &activation, &down, &ctr, &out})
+        TORCH_CHECK(t->device() == x.device() && t->is_contiguous(), "Inkling MoE scratch device/stride");
+    TORCH_CHECK(tables.dim() == 3 && tables.size(0) == 2 && tables.size(1) == 4 && tables.size(2) >= 8,
+                "Inkling MoE table layout");
+    TORCH_CHECK(sel.dim() == 2 && sel.size(0) == x.size(0) && sel.size(1) == 8 && rw.sizes() == sel.sizes(),
+                "Inkling MoE routing shape");
+    const int slots = sel.numel(), H = x.size(1);
+    TORCH_CHECK(activation.dim() == 2 && activation.size(0) == slots, "Inkling MoE activation shape");
+    const int I = activation.size(1);
+    TORCH_CHECK(H > 0 && I > 0 && H % 128 == 0 && I % 128 == 0, "Inkling MoE alignment");
+    TORCH_CHECK(gu.sizes() == at::IntArrayRef({2, slots, I}) && down.sizes() == at::IntArrayRef({slots, H})
+                && out.sizes() == x.sizes() && ctr.numel() >= slots * (I / 128) + x.size(0) * (H / 128),
+                "Inkling MoE scratch shape");
+    MoeCoopParams p = {};
+    if (tiles)
+    {
+        TORCH_CHECK(tiles->device() == x.device() && tiles->is_contiguous() && tiles->dim() == 2
+                    && (tiles->size(1) == 8 || tiles->size(1) == 16) && tiles->size(0) > 0 && tiles->size(0) <= 65535, "Inkling MoE slot tiles");
+        p.slot_tiles = tiles->data_ptr<int>();
+        p.num_tiles = tiles->size(0);
+    }
+    const int E = tables.size(2);
+    const int64_t* fields = tables.data_ptr<int64_t>();
+    p.g_trellis = p.u_trellis = fields;
+    p.g_suh = p.u_suh = fields + E;
+    p.g_svh = p.u_svh = fields + 2 * E;
+    p.gu_k2 = fields + 3 * E;
+    p.d_trellis = fields + 4 * E;
+    p.d_suh = fields + 5 * E;
+    p.d_svh = fields + 6 * E;
+    p.down_k2 = fields + 7 * E;
+    p.x = (const half*)x.data_ptr<at::Half>();
+    p.sel = sel.data_ptr<int64_t>();
+    p.rw_float = rw.data_ptr<float>();
+    p.Hi = p.Ho = p.H = p.H_out = p.out_stride = p.x_stride = H;
+    p.I = I;
+    p.bsz = p.rows_max = x.size(0);
+    p.topk = 8;
+    p.slots_max = slots;
+    p.min_expert = -1;
+    p.gated = true;
+    p.act_limit = gate_cap;
+    p.up_cap = up_cap;
+    p.gu_f32 = true;
+    p.gu_g = gu.data_ptr<float>();
+    p.gu_u = gu.data_ptr<float>() + slots * I;
+    p.act_out = (half*)activation.data_ptr<at::Half>();
+    p.d_out = down.data_ptr<float>();
+    p.out = out.data_ptr<float>();
+    p.ctr_a_len = slots * (I / 128);
+    p.ctr_b_len = p.bsz * (H / 128);
+    p.ctr_a = ctr.data_ptr<int>();
+    p.ctr_b = p.ctr_a + p.ctr_a_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int counters = p.ctr_a_len + p.ctr_b_len;
+    if (!tiles && p.bsz > 1 && E <= 32768 && ctr.numel() >= counters + 3 + 2 * slots)
+        p.runs = ctr.data_ptr<int>() + counters;
+
+#ifndef USE_ROCM
+    if (!tiles && H == exl3_moe_coop_ns::INKLING_HIDDEN && I == exl3_moe_coop_ns::INKLING_INTER
+        && (p.bsz == 1 || p.runs))
+    {
+        const auto* props = at::cuda::getDeviceProperties(x.get_device());
+        if (props->major == 12 && props->minor == 1)
+        {
+            if (p.bsz == 1) exl3_moe_coop_ns::inkling_decode<true>(p, stream);
+            else exl3_moe_coop_ns::inkling_decode<false>(p, stream);
+            return;
+        }
+    }
+#endif
+    if (tiles && tiles->size(1) == 16)
+        exl3_moe_coop_ns::inkling_batch<16>(p, stream);
+    else if (p.runs)
+        exl3_moe_coop_ns::inkling_batch<8>(p, stream);
+    else
+        exl3_moe_coop_launch(p, 0, 0, 2, x.get_device(), stream);
 }

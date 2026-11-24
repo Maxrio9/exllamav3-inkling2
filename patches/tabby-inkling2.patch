@@ -1,0 +1,1503 @@
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index 63972f9..e969172 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ from collections import OrderedDict
++from contextlib import aclosing
+ from dataclasses import dataclass
+ import gc
+ import pathlib
+@@ -27,6 +28,7 @@ from exllamav3 import (
+     Tokenizer,
+ )
+ from exllamav3.cache import CacheLayer_quant
++from exllamav3.generator.sampler import ArgmaxSampler
+ from backends.exllamav3.grammar import ExLlamaV3Grammar, MessageGate
+ 
+ from backends.exllamav3.sampler import (
+@@ -66,6 +68,7 @@ from common.transformers_utils import HFModel
+ from common.utils import unwrap
+ from endpoints.OAI.types.chat_completion import ChatCompletionLogprob, ChatCompletionLogprobLeaf
+ from endpoints.core.types.model import ModelCard, ModelCardParameters
++from endpoints.OAI.utils.toolcall_formats.inkling2 import ARCHITECTURE, END_SAMPLING
+ from endpoints.OAI.utils.tools import (
+     canonical_format_name,
+     detect_reasoning_tags,
+@@ -241,6 +244,7 @@ class ExllamaV3Container:
+     tool_format: Optional[str] = None
+     harmony: bool = False
+     muse_glimmer: bool = False
++    inkling2: bool = False
+     reasoning_budget_tokens: Optional[int] = None
+     reasoning_budget_message: Optional[str] = None
+ 
+@@ -344,6 +348,20 @@ class ExllamaV3Container:
+ 
+         self.model_dir = model_directory
+         self.hf_model = hf_model
++        architecture = (_hf.architectures or [None])[0]
++        self.inkling2 = architecture == ARCHITECTURE
++        if self.inkling2:
++            cache_mode = unwrap(kwargs.get("cache_mode"), "FP16")
++            if cache_mode not in ("FP16", "Q8") and not re.fullmatch(r"8\s*,\s*8", cache_mode):
++                raise ValueError(f"Inkling 2 supports cache_mode FP16 or Q8. Got {cache_mode}.")
++            if kwargs.get("tensor_parallel") or kwargs.get("gpu_split"):
++                raise ValueError(
++                    "Inkling 2 requires a single GPU. Remove GPU split and TP settings."
++                )
++            for filename in ("model.safetensors", "quantization_config.json", "tokenizer.json"):
++                path = model_directory / filename
++                if not path.is_file():
++                    raise FileNotFoundError(f"Inkling 2 release file is missing: {path}")
+         # Optional RYS layer map (list of layer indices or a string spec such
+         # as "0..6,4..6"); must be set when the config is created so the model
+         # is built with the mapped layer order
+@@ -354,6 +372,10 @@ class ExllamaV3Container:
+         self.model = Model.from_config(self.config)
+         self.tokenizer = Tokenizer.from_config(self.config)
+         self.bos_token_id = self.find_bos_token()
++        if self.inkling2:
++            self.inkling_stop_token = self.tokenizer.single_id(END_SAMPLING)
++            if self.inkling_stop_token is None:
++                raise ValueError(f"Inkling 2 tokenizer is missing {END_SAMPLING}.")
+ 
+         # Set CPU offload layers
+         self.config.infer_params.moe_cpu_offload = unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
+@@ -475,6 +497,20 @@ class ExllamaV3Container:
+         if self.sparse_draft_head < 0:
+             raise ValueError("sparse_draft_head must be 0 (off) or greater")
+ 
++        if self.inkling2 and (
++            (self.use_draft_model and draft_mode != "mtp")
++            or self.ngram_match_min or self.hybrid_draft_tokens or self.sparse_draft_head
++        ):
++            raise ValueError("Inkling 2 supports its release DSpark component with draft_mode mtp.")
++        if self.inkling2 and draft_mode == "mtp":
++            if cache_mode != "FP16":
++                raise ValueError(
++                    "Inkling 2 DSpark requires cache_mode FP16 for token-by-token equivalence. "
++                    "Set draft_mode to disabled to use Q8."
++                )
++            if "mtp" not in self.config.model_classes:
++                raise ValueError("Inkling 2 DSpark requires an mtp_config and release MTP weights.")
++
+         # Always disable draft if params are incorrectly configured
+         if draft_mode == "model" and draft_args and draft_model_name is None:
+             xlogger.warning(
+@@ -546,7 +582,10 @@ class ExllamaV3Container:
+         self.autosplit_reserve = [value / 1024 for value in autosplit_reserve_megabytes]
+ 
+         # Set GPU split options
+-        if gpu_count == 1:
++        if self.inkling2:
++            self.gpu_split_auto = False
++            gpu_device_list = [0]
++        elif gpu_count == 1:
+             self.gpu_split_auto = False
+             xlogger.info("Disabling GPU split because one GPU is in use.")
+         else:
+@@ -658,7 +697,9 @@ class ExllamaV3Container:
+ 
+         # Max batch size
+         default_mbs = 4 if self.model.caps.get("recurrent_states") else 128
+-        self.max_batch_size = unwrap(kwargs.get("max_batch_size"), default_mbs)
++        self.max_batch_size = (
++            1 if self.inkling2 else unwrap(kwargs.get("max_batch_size"), default_mbs)
++        )
+ 
+         # Recurrent checkpoint intervals (None = engine defaults)
+         self.recurrent_checkpoint_interval = kwargs.get("recurrent_checkpoint_interval")
+@@ -679,7 +720,9 @@ class ExllamaV3Container:
+         # Create cache
+         cache_mode_default = "FP16"
+         self.cache_mode = unwrap(kwargs.get("cache_mode"), cache_mode_default)
+-        self.recurrent_state_fp32 = unwrap(kwargs.get("recurrent_state_fp32"), False)
++        self.recurrent_state_fp32 = self.inkling2 or unwrap(
++            kwargs.get("recurrent_state_fp32"), False
++        )
+         xlogger.info(f"Recurrent state storage: {'fp32' if self.recurrent_state_fp32 else 'fp16'}")
+         self.cache = self.create_cache(self.cache_mode, self.model)
+ 
+@@ -692,31 +735,40 @@ class ExllamaV3Container:
+         # Make sure chunk size is >= 256, keep near or below max seq len
+         user_chunk_size = unwrap(kwargs.get("chunk_size"), 2048)
+         self.chunk_size = self.adjust_chunk_size(user_chunk_size)
++        if self.inkling2 and self.recurrent_checkpoint_interval_pp is None:
++            self.recurrent_checkpoint_interval_pp = self.chunk_size
+ 
+         # Output chunking
+         output_chunking = unwrap(kwargs.get("output_chunking"), True)
+         self.max_rq_tokens = self.chunk_size if output_chunking else None
+ 
+         # Warm up kernels and graphs after loading, sized from the settings above
+-        self.warmup_enabled = unwrap(kwargs.get("warmup"), False)
++        self.warmup_enabled = unwrap(kwargs.get("warmup"), self.inkling2)
+ 
+         # Template setup
+         self.prompt_template = await find_prompt_template(
+             kwargs.get("prompt_template"), model_directory
+         )
++        if self.inkling2 and self.prompt_template is None:
++            raise ValueError(
++                "Inkling 2 requires the official chat template. Provide chat_template.jinja "
++                f"in {model_directory} or set prompt_template."
++            )
+ 
+         # Tool calling. "auto" resolves the format from the model itself: the
+         # literal markers its chat template renders around a tool call, the
+         # special tokens in its tokenizer and, as a tie-breaker, its architecture
+         template_text = self.prompt_template.raw_template if self.prompt_template else None
+-        architecture = (self.hf_model.hf_config.architectures or [None])[0]
+ 
+         def has_token(token: str) -> bool:
+             return self.tokenizer.single_id(token) is not None
+ 
+         self.tool_format = kwargs.get("tool_format", "auto") or None
+         self.tool_format_evidence = "config"
+-        if self.tool_format == "auto":
++        if self.inkling2:
++            self.tool_format = "inkling2"
++            self.tool_format_evidence = "architecture"
++        elif self.tool_format == "auto":
+             detection = detect_tool_format(template_text, has_token, architecture)
+             self.tool_format = detection.tool_format
+             self.tool_format_evidence = ", ".join(detection.evidence)
+@@ -858,10 +910,9 @@ class ExllamaV3Container:
+                     "settings in the model config; they will be ignored."
+                 )
+ 
+-        # Resolve "auto" reasoning tokens. Harmony and Glimmer carry reasoning
+-        # in their message structure, so tags don't apply there
++        # Structured formats carry reasoning in their message headers.
+         reasoning_evidence = "config"
+-        if self.harmony or self.muse_glimmer:
++        if self.harmony or self.muse_glimmer or self.inkling2:
+             self.reasoning_start_token = None
+             self.reasoning_end_token = None
+         elif self.reasoning and not self.reasoning_explicit:
+@@ -879,7 +930,9 @@ class ExllamaV3Container:
+             self.reasoning_end_token = None
+ 
+         # One line saying what the server will parse and why
+-        if self.harmony:
++        if self.inkling2:
++            summary = "Inkling 2 typed message format"
++        elif self.harmony:
+             summary = "Harmony message format"
+         elif self.muse_glimmer:
+             summary = "Muse Glimmer message format"
+@@ -1092,12 +1145,17 @@ class ExllamaV3Container:
+ 
+             # Warm up before the generator attaches to the cache: the passes
+             # write into its leading pages and borrow recurrent-state slots
+-            if self.warmup_enabled:
++            if self.warmup_enabled and not self.inkling2:
+                 async for value in self.warmup_gen():
+                     yield value
+ 
+-            # Create async generator
++            # Inkling warms through the serving generator so the target and
++            # DSpark take the same decode path as the first client request.
+             await self.create_generator()
++            if self.warmup_enabled and self.inkling2:
++                yield 0, 1
++                await self.warmup_inkling()
++                yield 1, 1
+ 
+             # Clean up any extra vram usage from torch and cuda
+             # (Helps reduce VRAM bottlenecking on Windows)
+@@ -1113,6 +1171,25 @@ class ExllamaV3Container:
+             async with self.load_condition:
+                 self.load_condition.notify_all()
+ 
++    async def warmup_inkling(self):
++        started = time.perf_counter()
++        # Stay in the drafter's initial 32-token graph bucket. Sixteen output
++        # tokens let two full block-8 verification rounds run even at full acceptance.
++        input_ids = self.tokenizer.encode("The quick brown fox jumps over the lazy dog.")
++        job = AsyncJob(
++            self.generator,
++            input_ids=input_ids,
++            max_new_tokens=16 if self.use_draft_model else 2,
++            sampler=ArgmaxSampler(),
++            stop_conditions=[],
++        )
++        try:
++            async for _ in job:
++                pass
++        finally:
++            await job.cancel()
++        xlogger.info(f"Inkling 2 generation warmup finished in {time.perf_counter() - started:.1f} s")
++
+     async def warmup_gen(self):
+         """
+         Run exllamav3's warmup on the loaded model in a worker thread, yielding
+@@ -1186,6 +1263,20 @@ class ExllamaV3Container:
+ 
+     @torch.inference_mode()
+     def load_model_sync(self, progress_callback=None):
++        if self.inkling2:
++            # The cache is attached in create(). The engine's explicit-device
++            # load initializes it without the layer-split estimator.
++            xlogger.info(f"Loading model {self.model_dir} (single GPU)")
++            yield 0, 1
++            yield from self.model.load_gen(
++                device="cuda:0", max_chunk_size=self.chunk_size, max_batch_size=1
++            )
++            if self.draft_model is not None:
++                self.draft_model.attach_to(self.model)
++                self.draft_model.load()
++            yield 1, 1
++            return
++
+         # exllamav3 asserts on reserve_per_device and use_per_device together,
+         # so a model with a manual split gets the split and not the reserve
+         if self.use_vision:
+@@ -1312,6 +1403,8 @@ class ExllamaV3Container:
+                 hybrid_draft_tokens=self.hybrid_draft_tokens,
+                 draft_max_rows=self.draft_max_rows,
+                 sparse_draft_head=self.sparse_draft_head,
++                pipelined_prefill=not self.inkling2,
++                reuse_inkling_graphs=self.inkling2,
+                 **checkpoint_kwargs,
+                 **self.disk_cache_kwargs,
+             )
+@@ -1688,7 +1781,7 @@ class ExllamaV3Container:
+             self.active_job_ids[request_id] = None
+ 
+             # Yield from the internal generator
+-            async for generation_chunk in self.generate_gen(
++            generation = self.generate_gen(
+                 request_id=request_id,
+                 prompt=prompt,
+                 params=params,
+@@ -1698,11 +1791,13 @@ class ExllamaV3Container:
+                 channel_parser=channel_parser,
+                 label=label,
+                 return_logits=return_logits,
+-            ):
+-                yield generation_chunk
++            )
++            async with aclosing(generation):
++                async for generation_chunk in generation:
++                    yield generation_chunk
+         finally:
+             # Clean up and remove the job from active IDs
+-            del self.active_job_ids[request_id]
++            self.active_job_ids.pop(request_id, None)
+ 
+     async def _explore_job(
+         self,
+@@ -2372,7 +2467,7 @@ class ExllamaV3Container:
+         # ) and gen_settings.token_repetition_range == -1
+ 
+         prompts = [prompt]
+-        stop_conditions = params.stop
++        stop_conditions = list(params.stop)
+         add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
+         add_bos_token = add_bos_token and self.bos_token_id is not None
+         grammar_handler = ExLlamaV3Grammar()
+@@ -2381,13 +2476,13 @@ class ExllamaV3Container:
+         mm_embeddings_content = mm_embeddings.content if mm_embeddings else []
+ 
+         # Fetch EOS tokens from generation_config if they exist
+-        eos_tokens = self.hf_model.eos_tokens() or [self.tokenizer.eos_token_id]
+-
+-        stop_conditions += eos_tokens
+-
+-        # Include stop conditions deduced by backend tokenizer
+-        stop_conditions += self.config.eos_token_id_list
+-        stop_conditions = list(set(stop_conditions))
++        if self.inkling2:
++            # Keep per-block terminators in the stream and stop on the turn terminator.
++            eos_tokens = [self.inkling_stop_token]
++        else:
++            eos_tokens = self.hf_model.eos_tokens() or [self.tokenizer.eos_token_id]
++            stop_conditions += self.config.eos_token_id_list
++        stop_conditions = list(set([*stop_conditions, *eos_tokens]))
+ 
+         input_ids = [
+             self.encode_prompt(
+diff --git a/common/config_models.py b/common/config_models.py
+index e7b0b2c..9900bbd 100644
+--- a/common/config_models.py
++++ b/common/config_models.py
+@@ -498,9 +498,9 @@ class ModelConfig(BaseConfigModel):
+         ),
+     )
+     warmup: Optional[bool] = Field(
+-        False,
++        None,
+         description=(
+-            "Warm up the model after loading (default: False).\n"
++            "Warm up after loading (enabled by default for Inkling 2).\n"
+             "Runs a short schedule of forward passes so kernel compilation, autotuning\n"
+             "and CUDA graph capture happen at load time instead of on the first\n"
+             "requests. Adds some seconds to loading; sized from the cache, batch and\n"
+diff --git a/common/model.py b/common/model.py
+index 1e4d663..f2a139f 100644
+--- a/common/model.py
++++ b/common/model.py
+@@ -282,7 +282,8 @@ async def load_model_gen(model_path: pathlib.Path, request_wins: bool = False, *
+         # Add possible types of models that can be loaded
+         model_type = [ModelType.MODEL]
+ 
+-        if new_container.use_draft_model:
++        # Inkling loads the target and its attached DSpark in one phase.
++        if new_container.use_draft_model and not new_container.inkling2:
+             model_type.insert(0, ModelType.DRAFT)
+ 
+         if new_container.use_vision:
+diff --git a/common/networking.py b/common/networking.py
+index 6b38728..7d57291 100644
+--- a/common/networking.py
++++ b/common/networking.py
+@@ -111,6 +111,9 @@ class DisconnectHandler:
+         self,
+         request: Request,
+         description: str,
++        *,
++        watch: bool = True,
++        cancel_on_disconnect: bool = False,
+     ):
+         self.request = request
+         self.abort_event = asyncio.Event()
+@@ -119,7 +122,8 @@ class DisconnectHandler:
+         self.description = description
+ 
+         self._reported = False
+-        self._watcher = asyncio.create_task(self._watch())
++        self._request_task = asyncio.current_task() if cancel_on_disconnect else None
++        self._watcher = asyncio.create_task(self._watch()) if watch else None
+ 
+     async def _watch(self):
+         """Wait for the client to disconnect and flag it."""
+@@ -142,6 +146,8 @@ class DisconnectHandler:
+ 
+         self.disconnected = True
+         self.abort_event.set()
++        if self._request_task is not None:
++            self._request_task.cancel()
+ 
+     async def poll(self):
+         """
+@@ -154,8 +160,9 @@ class DisconnectHandler:
+         if not self.disconnected:
+             return
+ 
+-        # Trigger any cleanup tasks
+-        await self.cleanup()
++        # A watcher that cancels the request leaves cleanup to that request.
++        if self._request_task is None:
++            await self.cleanup()
+ 
+         # Log and raise
+         if not self._reported:
+@@ -175,7 +182,8 @@ class DisconnectHandler:
+ 
+     # Safe to call redundantly, each cleanup task must be called exactly once
+     async def cleanup(self):
+-        self._watcher.cancel()
++        if self._watcher is not None:
++            self._watcher.cancel()
+         for func, args in self.cleanup_tasks.values():
+             await func(*args)
+         self.cleanup_tasks = {}
+diff --git a/config_sample.yml b/config_sample.yml
+index 17f1148..5bc722e 100644
+--- a/config_sample.yml
++++ b/config_sample.yml
+@@ -298,11 +298,11 @@ model:
+   # wins over the file.
+   use_generation_config: false
+ 
+-  # Warm up the model after loading (default: False).
++  # Warm up after loading (enabled by default for Inkling 2).
+   # Runs a short schedule of forward passes so kernel compilation, autotuning and CUDA graph
+   # capture happen at load time instead of on the first requests. Adds some seconds to loading;
+   # sized from the cache, batch and chunk settings in effect.
+-  warmup: false
++  warmup:
+ 
+   # Keep the vision model's weights in system RAM instead of VRAM (default: False).
+   # Weights are stored in pinned host memory and streamed to the GPU during inference,
+diff --git a/endpoints/OAI/router.py b/endpoints/OAI/router.py
+index 36ddc2d..dc66475 100644
+--- a/endpoints/OAI/router.py
++++ b/endpoints/OAI/router.py
+@@ -193,11 +193,19 @@ async def chat_completion_request(
+         data.json_schema = data.response_format.json_schema
+ 
+     try:
+-        disconnect_handler = DisconnectHandler(request, f"{request_tag(request)} chat/completions")
+-        await disconnect_handler.poll()
+-
+-        if data.stream and not config.developer.disable_request_streaming:
++        streaming = data.stream and not config.developer.disable_request_streaming
++        if streaming:
+             model.check_context_length(prompt, data, mm_embeddings)
++        # EventSourceResponse owns receive() for SSE. For a buffered response,
++        # the watcher also cancels generation while it is waiting for a token.
++        disconnect_handler = DisconnectHandler(
++            request,
++            f"{request_tag(request)} chat/completions",
++            watch=not streaming,
++            cancel_on_disconnect=not streaming,
++        )
++
++        if streaming:
+             return EventSourceResponse(
+                 stream_generate_chat_completion(
+                     prompt, mm_embeddings, data, request, model_path, disconnect_handler
+diff --git a/endpoints/OAI/utils/chat_completion.py b/endpoints/OAI/utils/chat_completion.py
+index 99a317c..3b7ec49 100644
+--- a/endpoints/OAI/utils/chat_completion.py
++++ b/endpoints/OAI/utils/chat_completion.py
+@@ -6,6 +6,7 @@ import pathlib
+ from asyncio import CancelledError
+ from time import time
+ from typing import List, Optional
++from anyio import CancelScope
+ from fastapi import HTTPException, Request
+ from jinja2 import TemplateError
+ from common.errors import (
+@@ -40,14 +41,17 @@ from endpoints.OAI.types.chat_completion import (
+ )
+ from endpoints.OAI.types.common import Timings, UsageStats
+ from endpoints.OAI.utils.completion import _gen_label, _parse_gen_request_id
++from endpoints.OAI.utils.inkling2_stream import InklingStreamParser
+ from endpoints.OAI.utils.stream_parser import (
+     CONTENT,
+     REASONING,
++    TOOL,
+     ChannelStreamParser,
+     GlimmerStreamParser,
+     HarmonyStreamParser,
+     TagStreamParser,
+ )
++from endpoints.OAI.utils.toolcall_formats.inkling2 import END_MESSAGE
+ from endpoints.OAI.utils.tools import (
+     get_toolcall_tags,
+     parse_toolcalls,
+@@ -141,10 +145,9 @@ def _resolve_start_in_reasoning(prompt: str, data: ChatCompletionRequest) -> boo
+     """Determine whether generation starts inside a reasoning block."""
+ 
+     mc = model.container
+-    if mc.harmony or mc.muse_glimmer:
+-        # Harmony and Glimmer message headers determine the channel; there
+-        # is no ambiguity for the parser to resolve, except for a continued
+-        # message, whose header is in the prompt
++    if mc.harmony or mc.muse_glimmer or getattr(mc, "tool_format", None) == "inkling2":
++        # The parser will find the channel header unless it is already in
++        # the prompt as part of a continued message.
+         return _continued_field(data) == "reasoning_content"
+     if not mc.reasoning:
+         return False
+@@ -620,6 +623,8 @@ async def apply_chat_template(data: ChatCompletionRequest):
+ 
+     # Locally store tools dict
+     tools = data.model_dump()["tools"]
++    if getattr(model.container, "tool_format", None) == "inkling2" and data.tool_choice == "none":
++        tools = None
+ 
+     try:
+         data.template_vars = resolve_template_vars(data, model.container)
+@@ -753,7 +758,9 @@ def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
+     to final content. None if the model has no reasoning format to end.
+     """
+ 
+-    if mc.harmony:
++    if getattr(mc, "tool_format", None) == "inkling2":
++        suffix = END_MESSAGE
++    elif mc.harmony:
+         suffix = "<|end|><|start|>assistant<|channel|>final<|message|>"
+     elif mc.muse_glimmer:
+         suffix = "<|eom|><|start|>assistant to=user<|message|>"
+@@ -781,9 +788,7 @@ async def _chat_stream_collector(
+     Starts a request on the backend and collects generations while tracking phase, for a single
+     choice.
+ 
+-    In streaming mode, emits chunks of text to be emitted as deltas to the client, divided into
+-    reasoning/content/tool phases. Tool calls are parsed together at the end of stream, so the
+-    last chunk contains all tool calls collected for the turn.
++    In streaming mode, emits reasoning, content, and tool deltas to the client.
+ 
+     In non-streaming mode, collects everything with the same logic but then emits a single
+     response packet at the end, to be combined with any other choices (for n>1 requests) and
+@@ -795,13 +800,19 @@ async def _chat_stream_collector(
+     full_reasoning = ""
+     full_content = ""
+     full_tool = ""
++    inkling_calls = []
++    is_inkling = getattr(mc, "tool_format", None) == "inkling2"
+ 
+     # A continued message is left open by the prompt, its header already passed
+     initial_channel = None
+     if params.continue_final_message:
+         initial_channel = REASONING if start_in_reasoning_mode else CONTENT
+ 
+-    if mc.harmony:
++    if is_inkling:
++        tool_format = "inkling2"
++        use_tool = False
++        parser = InklingStreamParser(initial_channel)
++    elif mc.harmony:
+         # Harmony messages carry their own channel structure, superseding the
+         # reasoning and tool format settings
+         tool_format = "harmony"
+@@ -876,6 +887,7 @@ async def _chat_stream_collector(
+     # Collect logprobs
+     collected_logprobs = []
+ 
++    new_generation = None
+     try:
+         new_generation = mc.stream_generate(
+             request_id,
+@@ -907,16 +919,29 @@ async def _chat_stream_collector(
+             delta_reasoning = ""
+             delta_content = ""
+             tool_deltas: list = []
++            inkling_deltas: list[dict] = []
+             for channel, sub in events:
+                 if channel == REASONING:
+                     delta_reasoning += sub
+                     full_reasoning += sub
++                    if is_inkling and streaming_mode:
++                        inkling_deltas.append({"delta_reasoning_content": sub})
+                 elif channel == CONTENT:
+                     if strip_content_lead:
+                         sub = sub.lstrip()
+                         strip_content_lead = not sub
+                     delta_content += sub
+                     full_content += sub
++                    if is_inkling and streaming_mode and sub:
++                        inkling_deltas.append({"delta_content": sub})
++                elif is_inkling and channel == TOOL:
++                    if params.tool_choice != "none":
++                        for call in parse_toolcalls(sub, tool_format):
++                            call.index = len(inkling_calls)
++                            dumped = call.model_dump(mode="json")
++                            inkling_calls.append(dumped)
++                            if streaming_mode:
++                                inkling_deltas.append({"delta_tool_calls": [dumped]})
+                 else:
+                     full_tool += sub
+                     if tool_streamer is not None:
+@@ -948,8 +973,21 @@ async def _chat_stream_collector(
+             if "logprobs_content" in generation and not parser.saw_tag and parser.in_content:
+                 collected_logprobs += generation["logprobs_content"]
+ 
++            if is_inkling and finish_reason == "stop" and inkling_calls:
++                generation["finish_reason"] = "tool_calls"
++
+             # Add the output and emit
+-            if streaming_mode:
++            if streaming_mode and is_inkling:
++                for delta in inkling_deltas:
++                    if "delta_content" in delta and collected_logprobs:
++                        delta["logprob_response"] = ChatCompletionLogprobs(
++                            content=collected_logprobs
++                        )
++                        collected_logprobs = []
++                    await gen_queue.put({"index": task_idx, **delta})
++                if finish_reason:
++                    await gen_queue.put(generation)
++            elif streaming_mode:
+                 # A chunk can span the end of the reasoning phase (merged
+                 # generator results). Emit the reasoning tail as its own
+                 # delta so no SSE frame carries both reasoning_content and
+@@ -994,6 +1032,9 @@ async def _chat_stream_collector(
+             if finish_reason:
+                 break
+ 
++        if streaming_mode and not generation.get("finish_reason"):
++            raise RuntimeError("Chat generation ended before a finish chunk arrived.")
++
+         # In non-streaming mode, return everything as a single result
+         if not streaming_mode:
+             has_content = bool(full_content.strip())
+@@ -1001,7 +1042,12 @@ async def _chat_stream_collector(
+                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
+             generation["reasoning_content"] = full_reasoning
+             generation["content"] = full_content if has_content else None
+-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label, param_types)
++            if is_inkling:
++                generation["tool_calls"] = inkling_calls
++            else:
++                generation["tool_calls"] = _parse_tool_calls(
++                    full_tool, tool_format, label, param_types
++                )
+             if full_tool:
+                 generation["finish_reason"] = "tool_calls"
+             return generation
+@@ -1011,6 +1057,21 @@ async def _chat_stream_collector(
+             await gen_queue.put(e)
+         else:
+             return e
++    finally:
++        # The backend iterator can still be suspended at its terminal yield.
++        if new_generation is not None:
++            await new_generation.aclose()
++
++
++async def _cleanup_chat_generation(gen_tasks, disconnect_handler):
++    # SSE exits inside a cancelled AnyIO scope. Release backend jobs before
++    # returning even when a choice is parked waiting for its next token.
++    with CancelScope(shield=True):
++        for task in gen_tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*gen_tasks, return_exceptions=True)
++        await disconnect_handler.cleanup()
+ 
+ 
+ async def stream_generate_chat_completion(
+@@ -1119,7 +1180,8 @@ async def stream_generate_chat_completion(
+                         )
+ 
+             # Check if all tasks are completed
+-            if all(task.done() for task in gen_tasks) and gen_queue.empty():
++            if remaining_n == 0:
++                await asyncio.gather(*gen_tasks)
+                 xlogger.debug(f"{request_tag(request)} chat completion stream finished")
+                 yield "[DONE]"
+                 break
+@@ -1141,7 +1203,7 @@ async def stream_generate_chat_completion(
+         yield get_generator_error("Chat completion aborted. Please check the server console.")
+ 
+     finally:
+-        await disconnect_handler.cleanup()
++        await _cleanup_chat_generation(gen_tasks, disconnect_handler)
+ 
+ 
+ async def generate_chat_completion(
+@@ -1228,4 +1290,4 @@ async def generate_chat_completion(
+         raise HTTPException(503, error_message) from exc
+ 
+     finally:
+-        await disconnect_handler.cleanup()
++        await _cleanup_chat_generation(gen_tasks, disconnect_handler)
+diff --git a/endpoints/OAI/utils/inkling2_stream.py b/endpoints/OAI/utils/inkling2_stream.py
+new file mode 100644
+index 0000000..3b9cc41
+--- /dev/null
++++ b/endpoints/OAI/utils/inkling2_stream.py
+@@ -0,0 +1,88 @@
++"""Incremental parser for Inkling's repeated typed model messages."""
++
++import re
++
++from endpoints.OAI.utils.stream_parser import CONTENT, REASONING, TOOL, _partial_token_len
++from endpoints.OAI.utils.toolcall_formats.inkling2 import (
++    END_MESSAGE,
++    END_SAMPLING,
++    INVOKE_TOOL,
++    MODEL_MESSAGE,
++    TEXT,
++    THINKING,
++)
++
++_CHANNELS = {THINKING: REASONING, TEXT: CONTENT, INVOKE_TOOL: TOOL}
++_TOKENS = [MODEL_MESSAGE, *_CHANNELS, END_MESSAGE, END_SAMPLING]
++_TOKEN_RE = re.compile("|".join(map(re.escape, _TOKENS)))
++_MAX_HOLD = max(map(len, _TOKENS)) - 1
++_TOKEN_FIRST = frozenset(token[0] for token in _TOKENS)
++
++
++class InklingStreamParser:
++    """Emit text as it arrives and each tool body once its message closes."""
++
++    def __init__(self, initial_channel: str | None = None):
++        self._channel = initial_channel
++        self._pending = ""
++        self._tool_parts: list[str] = []
++        self._ended = False
++        self.saw_tag = False
++
++    @property
++    def in_reasoning(self) -> bool:
++        return self._channel == REASONING
++
++    @property
++    def in_content(self) -> bool:
++        return self._channel == CONTENT
++
++    @property
++    def in_tool(self) -> bool:
++        return self._channel == TOOL
++
++    def _route(self, text: str, events: list[tuple[str, str]]):
++        if text and self.in_tool:
++            self._tool_parts.append(text)
++        elif text and self._channel is not None:
++            events.append((self._channel, text))
++
++    def _close(self, events: list[tuple[str, str]]):
++        if self.in_tool and self._tool_parts:
++            events.append((TOOL, "".join(self._tool_parts)))
++            self._tool_parts.clear()
++        self._channel = None
++
++    def feed(self, text: str) -> list[tuple[str, str]]:
++        self.saw_tag = False
++        self._pending += text
++        events = []
++        while self._pending and not self._ended:
++            match = _TOKEN_RE.search(self._pending)
++            if match is None:
++                hold = _partial_token_len(self._pending, _TOKENS, _TOKEN_FIRST, _MAX_HOLD)
++                emit = len(self._pending) - hold
++                self._route(self._pending[:emit], events)
++                self._pending = self._pending[emit:]
++                break
++
++            self.saw_tag = True
++            self._route(self._pending[: match.start()], events)
++            self._close(events)
++            self._pending = self._pending[match.end() :]
++            token = match[0]
++            self._channel = _CHANNELS.get(token)
++            self._ended = token == END_SAMPLING
++        if self._ended:
++            self._pending = ""
++        return events
++
++    def finish(self) -> list[tuple[str, str]]:
++        events = []
++        # Keep a trailing literal '<', but discard incomplete control tags.
++        if self._pending == "<":
++            self._route(self._pending, events)
++        self._pending = ""
++        self._close(events)
++        self._ended = True
++        return events
+diff --git a/endpoints/OAI/utils/toolcall_formats/inkling2.py b/endpoints/OAI/utils/toolcall_formats/inkling2.py
+new file mode 100644
+index 0000000..4b5163c
+--- /dev/null
++++ b/endpoints/OAI/utils/toolcall_formats/inkling2.py
+@@ -0,0 +1,42 @@
++"""Inkling 2's JSON tool calls, one object per typed message."""
++
++import json
++
++from endpoints.OAI.types.tools import Tool, ToolCall
++from endpoints.OAI.utils.toolcall_formats.common import FormatSignature
++
++ARCHITECTURE = "Inkling2LoopForConditionalGeneration"
++MODEL_MESSAGE = "<|message_model|>"
++THINKING = "<|content_thinking|>"
++TEXT = "<|content_text|>"
++INVOKE_TOOL = "<|content_invoke_tool_json|>"
++END_MESSAGE = "<|end_message|>"
++END_SAMPLING = "<|content_model_end_sampling|>"
++
++TOOLCALL_START = None
++TOOLCALL_END = None
++DETECT = FormatSignature(
++    template_markers=(MODEL_MESSAGE, THINKING, INVOKE_TOOL, END_SAMPLING),
++    special_tokens=(MODEL_MESSAGE, THINKING, TEXT, INVOKE_TOOL, END_MESSAGE, END_SAMPLING),
++    architectures=(ARCHITECTURE,),
++    structured=True,
++)
++
++
++def parse_toolcalls(text: str) -> list[ToolCall]:
++    try:
++        body = json.loads(text)
++    except (ValueError, RecursionError):
++        return []
++
++    if not isinstance(body, dict):
++        return []
++    name = body.get("name")
++    arguments = body.get("args")
++    if not isinstance(name, str) or not name or not isinstance(arguments, dict):
++        return []
++    try:
++        arguments_json = json.dumps(arguments, ensure_ascii=True, allow_nan=False)
++    except ValueError:
++        return []
++    return [ToolCall(function=Tool(name=name, arguments=arguments_json))]
+diff --git a/endpoints/OAI/utils/tools.py b/endpoints/OAI/utils/tools.py
+index 469439c..19a13aa 100644
+--- a/endpoints/OAI/utils/tools.py
++++ b/endpoints/OAI/utils/tools.py
+@@ -24,6 +24,7 @@ from endpoints.OAI.utils.toolcall_formats import (
+     hermes,
+     kimi,
+     olmo3,
++    inkling2,
+ )
+ 
+ ALL_TOOLCALL_FORMATS = {
+@@ -36,6 +37,7 @@ ALL_TOOLCALL_FORMATS = {
+     "glm4_6": glm4_5,
+     "glm4_7": glm4_5,
+     "harmony": harmony,
++    "inkling2": inkling2,
+     "hermes": hermes,
+     "qwen3": hermes,
+     "qwen2_5": hermes,
+diff --git a/tests/fixtures/inkling2.jinja b/tests/fixtures/inkling2.jinja
+new file mode 100644
+index 0000000..cae99e0
+--- /dev/null
++++ b/tests/fixtures/inkling2.jinja
+@@ -0,0 +1,137 @@
++{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}
++{%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>", "tool": "<|message_tool|>"} -%}
++
++{%- macro emit_thinking_effort() -%}
++    {%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}
++    {%- if eff is string -%}
++        {%- set key = eff | trim -%}
++        {%- if key not in effort_map -%}
++            {{- raise_exception("Unknown reasoning_effort: " ~ eff) -}}
++        {%- endif -%}
++        {%- set num = effort_map[key] -%}
++    {%- else -%}
++        {%- set num = eff | float -%}
++    {%- endif -%}
++    {%- if num < 0.0 or num > 0.99 -%}
++        {{- raise_exception("reasoning_effort must be in [0.0, 0.99]") -}}
++    {%- endif -%}
++    {{- "<|message_system|><|content_text|>Thinking effort level: " -}}
++    {%- if num == 0.0 -%}0{%- else -%}{{ num }}{%- endif -%}
++    {{- "<|end_message|>" -}}
++{%- endmacro -%}
++
++{%- if tools -%}
++    {%- set tool_state = namespace(specs=[]) -%}
++    {%- for tool in tools -%}
++        {%- set fn = tool.function if tool.function is defined else tool -%}
++        {%- set spec = {
++            "description": (fn.description if fn.description is defined and fn.description else ""),
++            "name": fn.name,
++            "parameters": (fn.parameters if fn.parameters is defined and fn.parameters else {}),
++            "type": (tool.type if tool.type is defined and tool.type else "function"),
++        } -%}
++        {%- set tool_state.specs = tool_state.specs + [spec] -%}
++    {%- endfor -%}
++    {{- "<|message_system|>tool_declare<|content_xml|>" -}}
++    {{- tool_state.specs | tojson(sort_keys=true, separators=(",", ":")) -}}
++    {{- "<|end_message|>" -}}
++{%- endif -%}
++
++{%- set state = namespace(effort_emitted=false) -%}
++{%- for message in messages -%}
++    {%- if message.role not in role_token -%}
++        {{- raise_exception("Unknown message role: " ~ message.role) -}}
++    {%- endif -%}
++    {%- if not state.effort_emitted and message.role != "system" -%}
++        {{- emit_thinking_effort() -}}
++        {%- set state.effort_emitted = true -%}
++    {%- endif -%}
++
++    {%- set header = namespace(text=role_token[message.role]) -%}
++    {%- if message.role == "tool" -%}
++        {%- if message.name is defined and message.name -%}
++            {%- set header.text = header.text ~ message.name -%}
++        {%- elif message.tool_call_id is defined and message.tool_call_id -%}
++            {%- for prev in messages -%}
++                {%- if prev.role == "assistant" and prev.tool_calls -%}
++                    {%- for tc in prev.tool_calls -%}
++                        {%- if tc.id is defined and tc.id == message.tool_call_id and tc.function.name is defined -%}
++                            {%- set header.text = header.text ~ tc.function.name -%}
++                        {%- endif -%}
++                    {%- endfor -%}
++                {%- endif -%}
++            {%- endfor -%}
++        {%- endif -%}
++    {%- elif message.role == "assistant" and message.name is defined and message.name -%}
++        {%- set header.text = header.text ~ message.name -%}
++    {%- endif -%}
++    {%- set rtok = header.text -%}
++    {%- set rendered -%}
++
++    {%- if message.role == "assistant" and message.reasoning_content is defined and message.reasoning_content -%}
++        {{- rtok ~ "<|content_thinking|>" ~ message.reasoning_content ~ "<|end_message|>" -}}
++    {%- endif -%}
++
++    {%- if message.content is string and (message.content or not (message.role == "assistant" and (message.tool_calls or message.reasoning_content))) -%}
++        {{- rtok ~ "<|content_text|>" ~ message.content ~ "<|end_message|>" -}}
++    {%- elif message.content -%}
++        {%- for part in message.content -%}
++            {%- if part is string -%}
++                {{- rtok ~ "<|content_text|>" ~ part ~ "<|end_message|>" -}}
++            {%- elif part.type is not defined or part.type in ("text", "input_text") -%}
++                {%- set text_part = (part.text if part.text is defined and part.text is string else "") -%}
++                {{- rtok ~ "<|content_text|>" ~ text_part ~ "<|end_message|>" -}}
++            {%- elif part.type in ("image", "input_image", "image_url") -%}
++                {%- if message.role not in ("user", "tool") -%}
++                    {{- raise_exception("Image content is only supported for user and tool messages") -}}
++                {%- endif -%}
++                {{- rtok ~ "<|content_image|><|unused_200054|><|end_message|>" -}}
++            {%- elif part.type in ("audio", "input_audio", "audio_url") -%}
++                {{- raise_exception("Inkling 2 does not accept audio input") -}}
++            {%- else -%}
++                {{- raise_exception("Unsupported content part type: " ~ part.type) -}}
++            {%- endif -%}
++        {%- endfor -%}
++    {%- endif -%}
++
++    {%- if message.role == "assistant" and message.tool_calls -%}
++        {%- for tc in message.tool_calls -%}
++            {%- set fn = tc.function -%}
++            {%- if fn.name is not defined or fn.name is not string -%}
++                {{- raise_exception("tool call function name must be a string") -}}
++            {%- endif -%}
++            {%- if message.name is defined and message.name and message.name != fn.name -%}
++                {{- raise_exception("assistant name " ~ message.name ~ " does not match its tool call " ~ fn.name) -}}
++            {%- endif -%}
++            {%- set args = fn.arguments if fn.arguments is defined and fn.arguments else {} -%}
++            {%- if args is string -%}
++                {{- raise_exception("tool call arguments must be a parsed object, not a JSON string; canonicalize upstream") -}}
++            {%- endif -%}
++            {%- if args is not mapping -%}
++                {{- raise_exception("tool call arguments must be an object") -}}
++            {%- endif -%}
++            {{- "<|message_model|>" ~ fn.name ~ "<|content_invoke_tool_json|>" -}}
++            {{- '{"name":' ~ (fn.name | tojson(sort_keys=true, separators=(",", ":"))) ~ ',"args":' -}}
++            {{- "{" -}}
++            {%- for key, value in args | dictsort(case_sensitive=true) -%}
++                {{- (key | tojson) ~ ":" ~ (value | tojson(separators=(",", ":"))) -}}
++                {%- if not loop.last -%},{%- endif -%}
++            {%- endfor -%}
++            {{- "}}<|end_message|>" -}}
++        {%- endfor -%}
++    {%- endif -%}
++
++    {%- if message.role == "assistant" -%}
++        {{- "<|content_model_end_sampling|>" -}}
++    {%- endif -%}
++    {%- endset -%}
++    {%- if message.role == "assistant" -%}
++        {%- generation -%}{{- rendered -}}{%- endgeneration -%}
++    {%- else -%}
++        {{- rendered -}}
++    {%- endif -%}
++{%- endfor -%}
++
++{%- if not state.effort_emitted -%}
++    {{- emit_thinking_effort() -}}
++{%- endif -%}
+diff --git a/tests/fixtures/inkling2_stream.json b/tests/fixtures/inkling2_stream.json
+new file mode 100644
+index 0000000..cb97de1
+--- /dev/null
++++ b/tests/fixtures/inkling2_stream.json
+@@ -0,0 +1,19 @@
++[
++  "<|message_model|>",
++  "<|content_thinking|>",
++  "Check ",
++  "Berlin.",
++  "<|end_message|>",
++  "<|message_model|>weather",
++  "<|content_invoke_tool_json|>",
++  "{\"name\":\"weather\",\"args\":{\"city\":\"Berlin\",",
++  "\"units\":{\"metric\":true}}}",
++  "<|end_message|>",
++  "<|message_model|><|content_thinking|>",
++  "Check Paris too.",
++  "<|end_message|><|message_model|>weather<|content_invoke_tool_json|>",
++  "{\"name\":\"weather\",\"args\":{\"city\":\"Paris\",\"days\":[1,2]}}",
++  "<|end_message|><|message_model|><|content_text|>I’ll check both.",
++  "<|end_message|>",
++  "<|content_model_end_sampling|>"
++]
+diff --git a/tests/test_inkling2.py b/tests/test_inkling2.py
+new file mode 100644
+index 0000000..dd30379
+--- /dev/null
++++ b/tests/test_inkling2.py
+@@ -0,0 +1,281 @@
++import asyncio
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import httpx
++import pytest
++
++from common import auth, model
++from common.templating import PromptTemplate
++from endpoints.OAI.types.chat_completion import ChatCompletionRequest
++from endpoints.OAI.utils.chat_completion import apply_chat_template
++from endpoints.OAI.utils.inkling2_stream import InklingStreamParser
++from endpoints.OAI.utils.stream_parser import CONTENT, REASONING, TOOL
++from endpoints.OAI.utils.toolcall_formats.inkling2 import (
++    ARCHITECTURE,
++    END_SAMPLING,
++    parse_toolcalls,
++)
++from endpoints.OAI.utils.tools import detect_tool_format
++from endpoints.server import setup_app
++
++FIXTURES = Path(__file__).parent / "fixtures"
++TEMPLATE = (FIXTURES / "inkling2.jinja").read_text(encoding="utf-8")
++REPLAY = json.loads((FIXTURES / "inkling2_stream.json").read_text(encoding="utf-8"))
++TRANSCRIPT = "".join(REPLAY)
++EXPECTED_TOOLS = [
++    ("weather", {"city": "Berlin", "units": {"metric": True}}),
++    ("weather", {"city": "Paris", "days": [1, 2]}),
++]
++REQUEST = {
++    "model": "3.3bpw",
++    "messages": [{"role": "user", "content": "Check the weather in Berlin and Paris."}],
++    "tools": [{"type": "function", "function": {"name": "weather"}}],
++    "chat_template_kwargs": {"reasoning_effort": "low"},
++}
++
++
++def coalesce(events):
++    result = []
++    for channel, text in events:
++        if channel != TOOL and result and result[-1][0] == channel:
++            result[-1] = (channel, result[-1][1] + text)
++        else:
++            result.append((channel, text))
++    return result
++
++
++@pytest.mark.parametrize(
++    "chunks",
++    [REPLAY, list(TRANSCRIPT), [TRANSCRIPT]],
++    ids=[
++        "replay",
++        "every-character",
++        "merged",
++    ],
++)
++def test_parser_replays_ordered_typed_messages(chunks):
++    parser = InklingStreamParser()
++    events = [event for chunk in chunks for event in parser.feed(chunk)]
++    events.extend(parser.finish())
++    assert coalesce(events) == [
++        (REASONING, "Check Berlin."),
++        (TOOL, '{"name":"weather","args":{"city":"Berlin","units":{"metric":true}}}'),
++        (REASONING, "Check Paris too."),
++        (TOOL, '{"name":"weather","args":{"city":"Paris","days":[1,2]}}'),
++        (CONTENT, "I’ll check both."),
++    ]
++
++
++def test_parser_emits_text_early_and_waits_for_complete_tool_messages():
++    parser = InklingStreamParser()
++    assert parser.feed("<|message_model|><|content_think") == []
++    assert parser.feed("ing|>now<|end_mess") == [(REASONING, "now")]
++    assert parser.feed('age|><|message_model|>f<|content_invoke_tool_json|>{"name":"f"') == []
++    assert parser.feed(',"args":{}}<|end_message|>') == [(TOOL, '{"name":"f","args":{}}')]
++    assert parser.feed("<|message_model|><|content_text|>I can ") == [(CONTENT, "I can ")]
++    assert parser.feed("answer.<|content_model_end_samp") == [(CONTENT, "answer.")]
++    assert parser.feed("ling|>ignored") == parser.finish() == []
++
++
++@pytest.mark.parametrize(
++    "body", ['{"name":', '{"name":"f","args":[]}', '{"name":"f","args":{"x":NaN}}']
++)
++def test_incomplete_or_invalid_tool_bodies_do_not_form_calls(body):
++    parser = InklingStreamParser()
++    assert parser.feed("<|message_model|>f<|content_invoke_tool_json|>" + body) == []
++    assert parse_toolcalls(parser.finish()[0][1]) == []
++
++
++def test_tool_format_detection():
++    assert detect_tool_format(TEMPLATE, lambda _: True, ARCHITECTURE).tool_format == "inkling2"
++
++
++@pytest.fixture
++def fake_model(monkeypatch):
++    async def stream_generate(*args, **kwargs):
++        # The engine consumes the turn terminator and reports it as EOS.
++        for text in REPLAY[:-1]:
++            yield {"text": text}
++        yield {"finish_reason": "stop", "eos_reason": "stop_token", "stop_str": END_SAMPLING}
++
++    container = SimpleNamespace(
++        model_dir=Path("/releases/3.3bpw"),
++        loaded=True,
++        prompt_template=PromptTemplate("inkling2", TEMPLATE),
++        hf_model=SimpleNamespace(add_bos_token=lambda: False),
++        get_special_tokens=dict,
++        template_vars_default={"reasoning_effort": "high"},
++        template_vars_force={},
++        use_vision=False,
++        harmony=False,
++        muse_glimmer=False,
++        tool_format="inkling2",
++        reasoning_budget_tokens=None,
++        reasoning_budget_message=None,
++        set_generation_phase=lambda *_: True,
++        validate_context_length=lambda *_: None,
++        stream_generate=stream_generate,
++    )
++    monkeypatch.setattr(model, "container", container)
++    monkeypatch.setattr(auth, "DISABLE_AUTH", True)
++    return container
++
++
++def test_request_to_template_history_and_reasoning_effort(fake_model):
++    request = ChatCompletionRequest.model_validate(
++        {
++            **REQUEST,
++            "reasoning_effort": "max",
++            "messages": [
++                *REQUEST["messages"],
++                {
++                    "role": "assistant",
++                    "content": None,
++                    "reasoning_content": "Check Berlin.",
++                    "tool_calls": [
++                        {
++                            "id": "call_berlin",
++                            "type": "function",
++                            "function": {"name": "weather", "arguments": '{"city":"Berlin"}'},
++                        }
++                    ],
++                },
++                {"role": "tool", "tool_call_id": "call_berlin", "content": "sunny"},
++            ],
++        }
++    )
++    prompt, _ = asyncio.run(apply_chat_template(request))
++    assert "Thinking effort level: 0.2<|end_message|>" in prompt
++    assert "<|content_thinking|>Check Berlin.<|end_message|>" in prompt
++    assert (
++        "<|message_model|>weather<|content_invoke_tool_json|>"
++        '{"name":"weather","args":{"city":"Berlin"}}<|end_message|>'
++    ) in prompt
++    assert prompt.endswith("<|message_tool|>weather<|content_text|>sunny<|end_message|>")
++
++
++def tool_values(calls):
++    return [(call["function"]["name"], json.loads(call["function"]["arguments"])) for call in calls]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_chat_completions_http(fake_model, stream):
++    async def request():
++        transport = httpx.ASGITransport(app=setup_app())
++        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++            return await client.post("/v1/chat/completions", json={**REQUEST, "stream": stream})
++
++    response = asyncio.run(asyncio.wait_for(request(), timeout=5))
++    assert response.status_code == 200, response.text
++    if stream:
++        frames = [
++            line.removeprefix("data: ")
++            for line in response.text.splitlines()
++            if line.startswith("data: ")
++        ]
++        assert frames.pop() == "[DONE]"
++        choices = [json.loads(frame)["choices"][0] for frame in frames]
++        assert choices.pop()["finish_reason"] == "tool_calls"
++        deltas = [choice["delta"] for choice in choices]
++        assert deltas[0]["role"] == "assistant"
++        assert "".join(delta.get("reasoning_content", "") for delta in deltas) == (
++            "Check Berlin.Check Paris too."
++        )
++        assert "".join(delta.get("content", "") for delta in deltas) == "I’ll check both."
++        tool_frames = [i for i, delta in enumerate(deltas) if delta.get("tool_calls")]
++        second_thinking = next(
++            i
++            for i, delta in enumerate(deltas)
++            if delta.get("reasoning_content") == "Check Paris too."
++        )
++        answer = next(i for i, delta in enumerate(deltas) if delta.get("content"))
++        assert tool_frames[0] < second_thinking < tool_frames[1] < answer
++        calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
++        assert [call["index"] for call in calls] == [0, 1]
++    else:
++        choice = response.json()["choices"][0]
++        assert choice["finish_reason"] == "tool_calls"
++        message = choice["message"]
++        assert message["reasoning_content"] == "Check Berlin.Check Paris too."
++        assert message["content"] == "I’ll check both."
++        calls = message["tool_calls"]
++
++    assert tool_values(calls) == EXPECTED_TOOLS
++    assert len({call["id"] for call in calls if call["id"].startswith("call_")}) == 2
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_chat_completions_cancels_waiting_generator_on_disconnect(fake_model, stream):
++    async def run():
++        parked = asyncio.Event()
++        disconnect = asyncio.Event()
++        tool_sent = asyncio.Event()
++        closed = asyncio.Event()
++        cleanup_calls = []
++        sent = []
++        request_body = json.dumps({**REQUEST, "stream": stream}).encode()
++
++        async def cancel_job():
++            await asyncio.sleep(0)
++            cleanup_calls.append("cancel")
++
++        async def stream_generate(
++            request_id, prompt, params, disconnect_handler, *_args, **_kwargs
++        ):
++            await disconnect_handler.add_cleanup_task(request_id, cancel_job, ())
++            try:
++                # Stop immediately after the first tool block has closed.
++                for text in REPLAY[:10]:
++                    yield {"text": text}
++                parked.set()
++                await asyncio.Event().wait()
++            finally:
++                await asyncio.sleep(0)
++                closed.set()
++
++        async def receive():
++            nonlocal request_body
++            if request_body:
++                body, request_body = request_body, b""
++                return {"type": "http.request", "body": body, "more_body": False}
++            await disconnect.wait()
++            return {"type": "http.disconnect"}
++
++        async def send(message):
++            sent.append(message)
++            if b'"tool_calls"' in message.get("body", b""):
++                tool_sent.set()
++
++        fake_model.stream_generate = stream_generate
++        app = setup_app()
++        scope = {
++            "type": "http",
++            "method": "POST",
++            "path": "/v1/chat/completions",
++            "query_string": b"",
++            "headers": [(b"content-type", b"application/json")],
++            "scheme": "http",
++            "client": ("127.0.0.1", 50000),
++            "server": ("test", 80),
++            "http_version": "1.1",
++            "asgi": {"spec_version": "2.4", "version": "3.0"},
++        }
++        request_task = asyncio.create_task(app(scope, receive, send))
++        try:
++            await asyncio.wait_for(parked.wait(), timeout=5)
++            if stream:
++                await asyncio.wait_for(tool_sent.wait(), timeout=5)
++            disconnect.set()
++            await asyncio.wait_for(request_task, timeout=5)
++        finally:
++            if not request_task.done():
++                request_task.cancel()
++                await asyncio.gather(request_task, return_exceptions=True)
++        assert closed.is_set()
++        assert cleanup_calls == ["cancel"]
++        assert all(b"[DONE]" not in message.get("body", b"") for message in sent)
++        assert sent[0]["status"] == (200 if stream else 422)
++
++    asyncio.run(run())
+diff --git a/tests/test_inkling2_loader.py b/tests/test_inkling2_loader.py
+new file mode 100644
+index 0000000..cf5eb92
+--- /dev/null
++++ b/tests/test_inkling2_loader.py
+@@ -0,0 +1,199 @@
++"""Exercise the Tabby loader against the merged engine with CPU test stubs."""
++
++import asyncio
++import json
++import os
++import runpy
++import subprocess
++import sys
++from pathlib import Path
++from contextlib import ExitStack
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++TABBY = Path(__file__).resolve().parents[1]
++ENGINE = Path(os.environ.get("INKLING_ENGINE", TABBY.parent)).resolve()
++
++
++@pytest.mark.parametrize("dspark,skip_warmup", [(False, False), (True, False), (False, True)])
++def test_inkling_loader_uses_registered_model_and_single_device(tmp_path, dspark, skip_warmup):
++    assert (ENGINE / "tests/parity/inkling2_cpu_runner.py").is_file(), "Set INKLING_ENGINE to the merged checkout"
++    pythonpath = [str(ENGINE), str(TABBY), str(ENGINE / ".cpu-deps")]
++    if os.environ.get("PYTHONPATH"):
++        pythonpath.append(os.environ["PYTHONPATH"])
++    subprocess.run(
++        [sys.executable, __file__, str(tmp_path), str(int(dspark)), str(int(skip_warmup))],
++        check=True,
++        env={**os.environ, "PYTHONPATH": os.pathsep.join(pythonpath)},
++        timeout=30,
++    )
++
++
++async def verify_loader(release, dspark, skip_warmup):
++    from torch import _dynamo
++    runpy.run_path(ENGINE / "tests/parity/inkling2_cpu_runner.py")["install_test_stubs"]()
++
++    from safetensors.torch import save_file
++    from tokenizers import Tokenizer, models
++
++    from backends.exllamav3 import model as backend
++    from common.transformers_utils import HFModel
++    from endpoints.OAI.types.chat_completion import ChatCompletionRequest
++    from endpoints.OAI.utils.toolcall_formats.inkling2 import (
++        ARCHITECTURE,
++        DETECT,
++        END_MESSAGE,
++        END_SAMPLING,
++    )
++    from exllamav3.architecture.inkling2_loop import Inkling2LoopModel
++    from exllamav3.cache.fp16 import CacheLayer_fp16
++    from exllamav3.cache.quant import CacheLayer_quant
++
++    tokens = ["<unk>", *DETECT.special_tokens]
++    vocab = {token: i for i, token in enumerate(tokens)}
++    tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
++    tokenizer.add_special_tokens(tokens[1:])
++    tokenizer.save(str(release / "tokenizer.json"))
++    raw = {
++        "architectures": [ARCHITECTURE],
++        "eos_token_id": [vocab[END_MESSAGE], vocab[END_SAMPLING]],
++        "text_config": {
++            "num_hidden_layers": 1,
++            "hidden_size": 16,
++            "n_routed_experts": 2,
++            "num_attention_heads": 2,
++            "num_key_value_heads": 2,
++            "head_dim": 8,
++            "local_layer_ids": [],
++            "vocab_size": len(vocab),
++            "loop_config": {"core_start": 0, "core_end": 1, "num_passes": 2},
++        },
++    }
++    if dspark:
++        raw["mtp_config"] = dict(
++            hidden_size=16, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
++            head_dim=8, intermediate_size=16, local_layer_ids=[], sliding_window_size=16,
++            block_size=8, markov_rank=4, target_layer_ids=[0, 2], rms_norm_eps=1e-6,
++            rope_theta=10000., max_position_embeddings=512, markov_head_type="rnn_hidden",
++        )
++        save_file({"fixture": backend.torch.zeros(1)}, release / "model-mtp.safetensors")
++    (release / "config.json").write_text(json.dumps(raw))
++    (release / "tokenizer_config.json").write_text(
++        json.dumps(
++            {
++                "added_tokens_decoder": {
++                    vocab[token]: {"content": token, "special": True} for token in tokens[1:]
++                },
++            }
++        )
++    )
++    (release / "quantization_config.json").write_text('{"bits":{}}')
++    template = TABBY / "tests/fixtures/inkling2.jinja"
++    (release / "chat_template.jinja").write_bytes(template.read_bytes())
++    hf_model = await HFModel.from_directory(release)
++
++    with pytest.raises(ValueError, match=r"supports cache_mode FP16 or Q8. Got Q4"):
++        await backend.ExllamaV3Container.create(release, hf_model, cache_mode="Q4")
++    with pytest.raises(FileNotFoundError, match=r"release file is missing: .*model.safetensors"):
++        await backend.ExllamaV3Container.create(release, hf_model)
++
++    save_file({"fixture": backend.torch.zeros(1)}, release / "model.safetensors")
++    with (
++        patch.object(backend.torch.cuda, "device_count", return_value=0),
++        patch.object(backend, "torch_gpu_problem", return_value=None),
++        patch.object(backend, "hardware_supports_exllamav3", return_value=True) as supports,
++    ):
++        if dspark:
++            with pytest.raises(ValueError, match="DSpark requires cache_mode FP16"):
++                await backend.ExllamaV3Container.create(
++                    release, hf_model, cache_mode="Q8", draft_model={"draft_mode": "mtp"}
++                )
++        container = await backend.ExllamaV3Container.create(
++            release, hf_model, max_batch_size=8, max_seq_len=256, cache_size=256,
++            cache_mode="FP16" if dspark else "Q8",
++            draft_model={"draft_mode": "mtp" if dspark else "disabled"},
++            **({"warmup": False} if skip_warmup else {}),
++        )
++    supports.assert_called_once_with([0])
++    assert isinstance(container.model, Inkling2LoopModel)
++    assert container.tool_format == "inkling2"
++    assert container.inkling_stop_token == vocab[END_SAMPLING]
++    assert container.tokenizer.get_id_to_piece_list(True)[vocab[END_MESSAGE]] == END_MESSAGE
++    assert container.cache_mode == ("FP16" if dspark else "Q8")
++    assert container.warmup_enabled is not skip_warmup
++    assert container.recurrent_checkpoint_interval_pp == container.chunk_size
++    assert container.max_batch_size == container.cache.num_slots == 1
++    assert len(container.cache.layers) == 2
++    cache_type = CacheLayer_fp16 if dspark else CacheLayer_quant
++    assert all(isinstance(layer, cache_type) for layer in container.cache.layers.values())
++    if not dspark:
++        assert all(layer.k_bits == layer.v_bits == 8 for layer in container.cache.layers.values())
++    assert not container.cache.initialized
++
++    load_gen = container.model.load_gen
++
++    def cpu_load_gen(*, device, **kwargs):
++        assert device == "cuda:0"
++        assert kwargs["max_batch_size"] == 1
++        assert not container.cache.initialized
++        yield from load_gen(device="cpu", **kwargs)
++
++    async def warm_before_ready():
++        assert container.cache.initialized and container.generator is not None
++        assert not container.loaded
++
++    with (
++        ExitStack() as stack,
++        patch.object(container, "warmup_inkling", AsyncMock(side_effect=warm_before_ready)) as warmup,
++        patch.object(container.model, "load_components"),
++        patch.object(container.model, "load_gen", side_effect=cpu_load_gen),
++    ):
++        if dspark:
++            # Replace the learned weights and CUDA pinned allocator only. Both
++            # models still load their real cache layers and build AsyncGenerator.
++            def cpu_components(device):
++                container.model.embedding = backend.torch.nn.Embedding(len(vocab), 16)
++                container.model.loop = backend.torch.nn.Identity()
++            stack.enter_context(patch.object(container.model, "load_components", side_effect=cpu_components))
++            stack.enter_context(patch.object(container.draft_model, "load_components"))
++            empty = backend.torch.empty
++            def cpu_empty(*args, **kwargs):
++                kwargs.pop("pin_memory", None)
++                return empty(*args, **kwargs)
++            stack.enter_context(patch.object(backend.torch, "empty", side_effect=cpu_empty))
++        expected_phases = 1 if skip_warmup else 2
++        assert [progress async for progress in container.load_gen()] == [(0, 1), (1, 1)] * expected_phases
++        assert warmup.await_count == expected_phases - 1
++    try:
++        assert container.loaded and container.cache.initialized
++        assert container.generator.generator.cache is container.cache
++        assert container.generator.generator.max_batch_size == 1
++        assert container.generator.generator.pipeline is None
++        assert container.generator.generator.reuse_inkling_graphs
++        assert container.generator.generator.dspark_draft is dspark
++        if dspark:
++            assert container.draft_model.target is container.model
++            assert container.draft_cache.initialized
++            assert container.draft_cache.layers[(0, 0)].rows.shape[:2] == (1, 256)
++            assert container.generator.generator.num_draft_tokens == 7
++
++        # Intercept the job before enqueueing. Generation itself needs CUDA.
++        params = ChatCompletionRequest(
++            messages=[{"role": "user", "content": "hello"}],
++            temperature=0.6, top_k=20, stop=["user stop"], max_tokens=8,
++        )
++        with patch.object(backend, "AsyncJob", side_effect=RuntimeError("captured")) as make_job:
++            with pytest.raises(RuntimeError, match="captured"):
++                await anext(container.stream_generate("r", "hello", params))
++        assert set(make_job.call_args.kwargs["stop_conditions"]) == {
++            "user stop",
++            vocab[END_SAMPLING],
++        }
++        assert params.stop == ["user stop"]
++    finally:
++        await container.unload()
++
++
++if __name__ == "__main__":
++    asyncio.run(verify_loader(Path(sys.argv[1]), *(bool(int(arg)) for arg in sys.argv[2:])))

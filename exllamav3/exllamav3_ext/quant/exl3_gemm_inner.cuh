@@ -34,7 +34,9 @@ void exl3_gemm_kernel_inner
     const int size_n,
     int* __restrict__ locks,
     const half* post_scale,
-    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+    int size_n_stride = 0,    // full width of B and C when computing a column slice (0: = size_n)
+    int logical_slices = 0,
+    int logical_slice = 0
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -104,9 +106,10 @@ void exl3_gemm_kernel_inner
     int blocks_n = tiles_n * TILEBLOCKS_N;
 
     // Start and end index of current slice, must span at least one tile
-    int num_slices = gridDim.x;
-    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
-    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    int num_slices = logical_slices ? logical_slices : (int) gridDim.x;
+    int slice = logical_slices ? logical_slice : (int) blockIdx.x;
+    int slice_beg = tiles_k * tiles_n * slice / num_slices;
+    int slice_end = tiles_k * tiles_n * (slice + 1) / num_slices;
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 

@@ -124,3 +124,25 @@ def test_incompatible_divisibility_rejected(device):
                       torch.ones(n, dtype = torch.half, device = device), n, s, True, False)
             checked += 1
     assert checked > 0
+
+
+@torch.inference_mode()
+def test_gb10_prefill_grid_independence(device):
+    if torch.cuda.get_device_capability(device) != (12, 1):
+        pytest.skip("GB10 cooperative launch geometry")
+    m, k, n, bits = 33, 2304, 1024, 6
+    g = torch.Generator(device=device).manual_seed(167)
+    x = torch.randn((m, k), device=device, dtype=torch.half, generator=g)
+    tr = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * bits),
+                       device=device, dtype=torch.int16, generator=g)
+    su = torch.ones(k, device=device, dtype=torch.half)
+    sv = torch.ones(n, device=device, dtype=torch.half)
+    expected = None
+    for shape in (5, 2, 6, 7):
+        for sms in (32, 38, 48):
+            c = torch.empty((m, n), device=device, dtype=torch.half)
+            ext.exl3_gemm(x, tr, c, su, torch.empty_like(x), sv, shape, False, True, sms)
+            if expected is None:
+                expected = c
+            else:
+                assert torch.equal(c, expected), (shape, sms)

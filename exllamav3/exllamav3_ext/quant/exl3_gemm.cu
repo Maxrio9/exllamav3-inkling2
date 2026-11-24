@@ -17,12 +17,38 @@ namespace cg = cooperative_groups;
     #include "../rocm/quant/exl3_mgemv_rdna.cuh"
     #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
 #endif
+#include <algorithm>
 #include <set>
 #include <vector>
 
 int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n_g[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim_g[] = {EXL3_GEMM_BLOCKDIM};
+
+// A change in either tile dimension can also change the reduction order.
+// Tune between latency candidates within one arithmetic family on GB10.
+static void keep_reduction_family(
+    std::vector<CoopAutotuneCandidate>& candidates, int device, GB10ReductionPlan plan)
+{
+    #ifndef USE_ROCM
+    const auto* prop = at::cuda::getDeviceProperties(device);
+    if (prop->major != 12 || prop->minor != 1) return;
+
+    auto matches = [&](const CoopAutotuneCandidate& c)
+    {
+        return exl3_gemm_tilesize_k_g[c.tag] == plan.tile_k &&
+               exl3_gemm_tilesize_n_g[c.tag] == plan.tile_n;
+    };
+    if (std::none_of(candidates.begin(), candidates.end(), matches))
+    {
+        auto tag = candidates.front().tag;
+        plan.tile_k = exl3_gemm_tilesize_k_g[tag];
+        plan.tile_n = exl3_gemm_tilesize_n_g[tag];
+    }
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [&](const auto& c) { return !matches(c); }), candidates.end());
+    #endif
+}
 
 /*
 EXL3 matmul, A @ B -> C
@@ -54,6 +80,14 @@ uint64_t roundup_pow2(uint64_t x)
     return x + 1;
 }
 
+// Rows 1..8 share one tuned configuration. The kernels give every row the same bits whatever the row count when the shape and
+// SM count are fixed, but the tuner may pick another shape or SM count per row-count bucket (1-2, 3-4, 5-8), and the
+// accumulation order then differs: a row of a speculative-decoding verify pass would not equal the same token decoded alone.
+static inline int autotune_rows(int size_m)
+{
+    return size_m <= 8 ? 2 : size_m;
+}
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -61,7 +95,6 @@ uint64_t gemm_autotune_hash
     int size_n,
     int K,
     bool c_fp32,
-    int device,
     int cc,
     int max_num_sms,
     int cb,
@@ -81,7 +114,8 @@ uint64_t gemm_autotune_hash
     mix((uint64_t) size_n);
     mix((uint64_t) K);
     mix(c_fp32 ? 1ull : 0ull);
-    mix((uint64_t) device);
+    // The tuner adds the model and driver to the on-disk key. The device
+    // ordinal is local to a process and belongs only in the launch cache.
     mix((uint64_t) cc);
     mix((uint64_t) max_num_sms);
     mix((uint64_t) cb);
@@ -95,7 +129,6 @@ uint64_t mgemm_autotune_hash
     int size_n,
     int K,
     bool c_fp32,
-    int device,
     int cc,
     int max_num_sms,
     int cb,
@@ -104,7 +137,7 @@ uint64_t mgemm_autotune_hash
     bool half_k
 )
 {
-    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb, half_k);
+    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, cc, max_num_sms, cb, half_k);
     auto mix = [&] (uint64_t v)
     {
         h ^= v;
@@ -310,7 +343,7 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+        uint64_t autotune_key = gemm_autotune_hash(autotune_rows(size_m), size_k, size_n, K, c_fp32, cc, num_sms, cb, half_k);
 #if defined(USE_ROCM)
         autotune_key ^= 0x52444e4157313031ull;   // RDNA grid rules (below) tune separately
 #endif
@@ -368,6 +401,7 @@ int exl3_gemm_gr
             });
         }
         TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
+        keep_reduction_family(candidates, device, gb10_reduction_plan(size_m, size_k, size_n, K, half_k, c_fp32, cb, 1));
 
         tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, smem_max, stream, (size_t) size_k * size_n);
         if (graph)
@@ -755,8 +789,9 @@ int exl3_mgemm_gr
     {
         uint64_t autotune_key = mgemm_autotune_hash
         (
-            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
+            autotune_rows(size_m), size_k, size_n, K, c_fp32, cc, total_sms, cb, bszm_in, bszm_out, half_k
         );
+        if (size_n_list_ptr) autotune_key ^= 0x7065726e6c697374ull;  // heterogeneous widths
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
         CoopAutotuneLaunch tuned;
@@ -792,6 +827,11 @@ int exl3_mgemm_gr
                 });
             }
             TORCH_CHECK(!candidates.empty(), "exl3_mgemm autotune: no compatible kernel shapes");
+            auto plan = gb10_reduction_plan(size_m, size_k, size_n, K, half_k, c_fp32, cb, bszm);
+            // Only the maximum width is known here for a list of separate outputs.
+            // Every supported width is divisible by 128.
+            if (size_n_list_ptr) plan.tile_n = 128;
+            keep_reduction_family(candidates, device, plan);
 
             tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, smem_max, stream, (size_t) size_k * size_n * bszm);
             add_graph_args((void*) tuned.kernel);

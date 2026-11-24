@@ -321,8 +321,13 @@ pipeline everywhere, for A/B testing.
 
 ### `EXLLAMAV3_TUNE_CACHE` (default: platform cache dir)
 
-Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
-selection results, persisted across runs).
+Set a file path or an existing directory for cooperative GEMM plans. On Linux the default is
+`$XDG_CACHE_HOME/exllamav3/autotune/coop_autotune_v1.bin` (with `~/.cache` as the fallback).
+Mount its parent directory in a persistent volume when starting disposable containers. The engine
+stores the selected shape, SM count and concurrency per GPU model, driver, kernel version and
+matrix geometry. Linux NVIDIA keys include the installed driver build. Other platforms use
+the driver version reported by the runtime. Cold processes sharing a writable cache reuse the first completed tuning result.
+A read-only cache can serve existing entries. A miss needs a writable directory to persist.
 
 ### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
 

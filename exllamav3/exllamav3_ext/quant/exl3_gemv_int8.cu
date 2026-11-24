@@ -4,6 +4,7 @@
 #include "comp_units/exl3_gemv_int8_instances.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/empty.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "../ptx.cuh"
@@ -134,35 +135,13 @@ static int* gemv_int8_get_ws(int device, size_t ws_ints)
     return ws.ws;
 }
 
-// m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
-// cooperative kernel (and from there to the regular fp16 kernel).
-static bool exl3_gemv_int8_sq
-(
-    const half* A_ptr, const uint16_t* B_ptr, void* C_ptr,
-    int size_m, int size_k, int size_n, int K, bool half_k, bool c_fp32, bool residual,
-    const half* suh_ptr, half* A_had_ptr, const half* svh_ptr,
-    int device, int num_sms, cudaStream_t stream, Graph* graph
-)
-{
-    if (size_m > 2) return false;
-    int M = size_m;
-    void* fn = select_gemv_int8_sq_kernel(K, half_k, M, c_fp32, residual);
-    if (!fn) return false;
+struct GemvSqConfig { int grid, rows_per, ksplit; size_t smem; };
 
+static GemvSqConfig gemv_sq_config(void* fn, int M, bool residual, int K, bool half_k,
+                                   int size_k, int size_n, int device, int num_sms)
+{
     int rows_max = gemv_int8_sq_rows_max(M, residual);
 
-    // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
-    auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
-    {
-        int rows_total = size_k / 16;
-        int nb256 = size_n / 256;
-        int r = CEIL_DIVIDE(rows_total * nb256, grid_);
-        rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
-        rows_per = MAX(rows_per, SQ_MINROWS);
-        rows_per = MIN(rows_per, rows_max);
-        rows_per = MIN(rows_per, (rows_total + 7) & ~7);
-        ksplit = CEIL_DIVIDE(rows_total, rows_per);
-    };
     auto smem_for = [&] (int rows_per) -> size_t
     {
         size_t stage = (size_t) gemv_int8_stage_bytes(K, half_k);
@@ -182,8 +161,7 @@ static bool exl3_gemv_int8_sq
         cuda_check(cudaPeekAtLastError());
     }
 
-    int ksplit, rows_per;
-    decomp(6 * num_sms, ksplit, rows_per);
+    int rows_per = gemv_sq_rows(size_k, size_n, 6 * num_sms, M, residual);
     size_t smem_guess = smem_for(rows_per);
     int maxb;
     auto occ_key = std::make_pair(fn, smem_guess);
@@ -196,10 +174,29 @@ static bool exl3_gemv_int8_sq
         gemv_occ_cache[device][occ_key] = maxb;
     }
     int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
-    decomp(grid, ksplit, rows_per);
+    rows_per = gemv_sq_rows(size_k, size_n, grid, M, residual);
+    int ksplit = CEIL_DIVIDE(size_k / 16, rows_per);
     size_t smem = smem_for(rows_per);
-    if (ksplit > SQ_KSPLIT_CAP) return false;
-    if (size_n / 256 > SQ_COUNTERS_CAP) return false;
+    return {grid, rows_per, ksplit, smem};
+}
+
+// m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
+// cooperative kernel (and from there to the regular fp16 kernel).
+static bool exl3_gemv_int8_sq
+(
+    const half* A_ptr, const uint16_t* B_ptr, void* C_ptr,
+    int size_m, int size_k, int size_n, int K, bool half_k, bool c_fp32, bool residual,
+    const half* suh_ptr, half* A_had_ptr, const half* svh_ptr,
+    int device, int num_sms, cudaStream_t stream, Graph* graph
+)
+{
+    if (size_m > 2) return false;
+    int M = size_m;
+    void* fn = select_gemv_int8_sq_kernel(K, half_k, M, c_fp32, residual);
+    if (!fn) return false;
+
+    auto [grid, rows_per, ksplit, smem] = gemv_sq_config(fn, M, residual, K, half_k, size_k, size_n, device, num_sms);
+    if (ksplit > SQ_KSPLIT_CAP || size_n / 256 > SQ_COUNTERS_CAP) return false;
 
     int pstride = size_n * (residual ? 2 : 1);
     int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * M * pstride);
@@ -391,3 +388,93 @@ bool exl3_gemv_int8
     add_graph_args((void*) fn);
     return true;
 }
+
+#ifndef USE_ROCM
+// Each z-plane runs one row of one projection with independent scratch.
+// The Hadamard helpers index scales by blockIdx.y, which must stay zero.
+// Each projection uses its scalar K partition for activation quantization.
+struct SqProjection {
+    const half *x, *suh, *svh;
+    const uint16_t* trellis;
+    half* out;
+    int width, rows_per, grid;
+};
+struct SqBundle { SqProjection matrices[4]; };
+
+__global__ __launch_bounds__(NUM_THREADS)
+void inkling_qkvg_sq_kernel(SqBundle bundle, int k, int* counters, int counter_stride,
+                            int* scratch, int scratch_stride)
+{
+    const int row = blockIdx.z / 4;
+    const auto& p = bundle.matrices[blockIdx.z % 4];
+    if (blockIdx.x >= p.grid) return;
+    int* slab = scratch + blockIdx.z * scratch_stride;
+    gemv_sq_body<6, 1, false, false, false>(
+        p.x + row * k, p.trellis, p.out + row * p.width, 1, k, p.width,
+        counters + blockIdx.z * counter_stride, (float*)slab, slab + 4 * SQ_KSPLIT_CAP,
+        p.suh, p.svh, p.rows_per, p.grid);
+}
+
+std::vector<at::Tensor> inkling_qkvg_sq(
+    const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh, const std::vector<at::Tensor>& svh,
+    const at::Tensor& counters)
+{
+    TORCH_CHECK(inputs.size() == 4 && trellis.size() == 4 && suh.size() == 4 && svh.size() == 4,
+                "inkling_qkvg_sq requires four projections");
+    TORCH_CHECK(inputs[0].is_cuda(), "expected CUDA inputs");
+    const at::cuda::OptionalCUDAGuard guard(inputs[0].device());
+    int device = inputs[0].get_device();
+    if (exl3_gemv_int8_mode() != 2 || exl3_gemv_int8_max_k(device) < 6 ||
+        DevCtx::instance().get_smem_max(device) < 80 * 1024) return {};
+    TORCH_CHECK(inputs[0].dim() == 3 && inputs[0].size(1) >= 1 && inputs[0].size(1) <= 8,
+                "expected one to eight QKVG rows");
+    const int rows = inputs[0].size(1);
+    const int k = inputs[0].size(2);
+    int sms = DevCtx::instance().get_num_sms(device);
+    void* single = select_gemv_int8_sq_kernel(6, false, 1, false, false);
+    SqBundle bundle;
+    int grid = 0, counter_stride = 0, partials = 0;
+    size_t smem = 0;
+    std::vector<at::Tensor> outputs;
+    for (int i = 0; i < 4; ++i) {
+        for (const auto* t : {&inputs[i], &trellis[i], &suh[i], &svh[i]})
+            TORCH_CHECK(t->device() == inputs[0].device() && t->is_contiguous(),
+                        "expected contiguous tensors on one device");
+        int n = svh[i].numel();
+        TORCH_CHECK(inputs[i].dim() == 3 && inputs[i].size(0) == 1 && inputs[i].size(1) == rows &&
+                    inputs[i].size(2) == k && k > 0 && k % 128 == 0 && n > 0 && n % 256 == 0 &&
+                    suh[i].numel() == k && trellis[i].dim() == 3 && trellis[i].size(0) == k / 16 &&
+                    trellis[i].size(1) == n / 16 && trellis[i].size(2) == 96,
+                    "invalid 6-bit QKVG projection dimensions");
+        auto cfg = gemv_sq_config(single, 1, false, 6, false, k, n, device, sms);
+        if (cfg.ksplit > SQ_KSPLIT_CAP || n / 256 > SQ_COUNTERS_CAP) return {};
+        grid = std::max(grid, cfg.grid);
+        smem = std::max(smem, cfg.smem);
+        counter_stride = std::max(counter_stride, n / 256);
+        partials = std::max(partials, n * cfg.ksplit);
+        outputs.push_back(at::empty({1, rows, n}, inputs[i].options()));
+        bundle.matrices[i] = {
+            (const half*)inputs[i].data_ptr<at::Half>(), (const half*)suh[i].data_ptr<at::Half>(),
+            (const half*)svh[i].data_ptr<at::Half>(), (const uint16_t*)trellis[i].data_ptr<int16_t>(),
+            (half*)outputs.back().data_ptr<at::Half>(), n, cfg.rows_per, cfg.grid
+        };
+    }
+    auto fn = (void*)inkling_qkvg_sq_kernel;
+    if (gemv_attr_set[device].insert(fn).second) {
+        cuda_check(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            gemv_int8_sq_rows_max(1, false) * 96 + gemv_int8_stage_bytes(6, false) + 1024));
+        cuda_check(cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                        cudaSharedmemCarveoutMaxShared));
+    }
+    auto options = inputs[0].options().dtype(at::kInt);
+    int stride = 4 * SQ_KSPLIT_CAP + partials;
+    TORCH_CHECK(counters.device() == inputs[0].device() && counters.is_contiguous() &&
+                counters.numel() >= rows * 4 * counter_stride, "invalid QKVG counter workspace");
+    auto scratch = at::empty({rows * 4, stride}, options);
+    inkling_qkvg_sq_kernel<<<dim3(grid, 1, rows * 4), NUM_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+        bundle, k, counters.data_ptr<int>(), counter_stride, scratch.data_ptr<int>(), stride);
+    cuda_check(cudaPeekAtLastError());
+    return outputs;
+}
+#endif

@@ -210,8 +210,8 @@ __device__ __forceinline__ SlotInfo slot_info(const MoeCoopParams& p, int s)
     SlotInfo si;
     si.row = s / p.topk;
     int64_t e = p.sel[s];
-    si.w = __half2float(p.rw[s]);
-    bool ok = si.w != 0.0f;
+    si.w = p.rw_float ? p.rw_float[s] : __half2float(p.rw[s]);
+    bool ok = p.rw_float || si.w != 0.0f;
     if (p.min_expert >= 0)
     {
         ok = ok && e >= p.min_expert && e < p.max_expert;
@@ -309,6 +309,17 @@ __device__ __forceinline__ void build_runs
 // The block's run: its slot indices into rows[] (shared) and the row count; false past the end
 __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, int* rows, int& nrows, int* sh_res)
 {
+    if (p.slot_tiles)
+    {
+        const int* tile = p.slot_tiles + run_idx * ROWS;
+        nrows = 0;
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) nrows += tile[r] >= 0;
+        if (!nrows) return false;
+        if (threadIdx.x < nrows) rows[threadIdx.x] = tile[threadIdx.x];
+        __syncthreads();
+        return true;
+    }
     if (!p.a_global)
     {
         // bsz 1: run = slot (an inactive slot returns false; kernel A checks for empty rows)
@@ -337,7 +348,7 @@ __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, in
 // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
 // dq_dispatch
 
-template <int bits, int cb, bool WIDE, bool HALF = false>
+template <int bits, int cb, bool WIDE, bool HALF = false, int TILE_ROWS = ROWS>
 __device__ __forceinline__ void gemv_tile
 (
     const uint32_t* __restrict__ B32,
@@ -353,7 +364,8 @@ __device__ __forceinline__ void gemv_tile
     int ntiles,
     int group,                          // block column group of tile_cols<WIDE>() columns
     float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
-    uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
+    uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
+    bool local_rows = false            // A rows packed in shared memory for this expert tile
 )
 {
     constexpr bool REG = HALF ? false : tile_reg<bits>();
@@ -379,7 +391,9 @@ __device__ __forceinline__ void gemv_tile
     // A fragment row of this lane: rows[lane / 4] of the run
     const int r0 = lane >> 2;
     const bool r0_ok = r0 < nrows;
-    const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
+    const size_t a_row0 = r0_ok ? (size_t) (local_rows ? r0 : rows[r0]) * a_stride2 : 0;
+    const bool r1_ok = TILE_ROWS == 16 && r0 + 8 < nrows;
+    const size_t a_row1 = r1_ok ? (size_t) rows[r0 + 8] * a_stride2 : 0;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -404,14 +418,21 @@ __device__ __forceinline__ void gemv_tile
     const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
     [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
 
+    // Consecutive prefill tiles reuse an expert's packed matrix. Streaming
+    // (evict-first) loads are appropriate for one-token GEMV.
+    auto load_word = [](const uint32_t* ptr)
+    {
+        if constexpr (TILE_ROWS == 16) return __ldg(ptr);
+        else return __ldcs(ptr);
+    };
     auto ld_b = [&] (int i, int l) -> uint32_t
     {
         if constexpr (REG && bits == 3)
-            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            return lane < 24 ? load_word(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
         else if constexpr (!REG)
-            return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            return (l * 32 + lane < GWORDS) ? load_word(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
         else
-            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            return load_word(bp + (size_t) i * slice_stride + l * LSTRIDE);
     };
 
     uint32_t pf[PF][LOADS];
@@ -423,7 +444,7 @@ __device__ __forceinline__ void gemv_tile
                 pf[d][l] = ld_b(d, l);
 
     FragC_h ch[WNT][2] = {};
-    float2 acc0[WNT][2] = {};
+    float2 acc[TILE_ROWS / 8][WNT][2] = {};
 
     for (int ib = 0; ib < myn; ib += PF)
     {
@@ -460,8 +481,8 @@ __device__ __forceinline__ void gemv_tile
             FragB a01, a23;
             a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
+            a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
+            a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
@@ -502,9 +523,13 @@ __device__ __forceinline__ void gemv_tile
                     #pragma unroll
                     for (int f = 0; f < 2; ++f)
                     {
-                        acc0[t][f].x += __low2float(ch[t][f][0]);
-                        acc0[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
+                        #pragma unroll
+                        for (int h = 0; h < TILE_ROWS / 8; ++h)
+                        {
+                            acc[h][t][f].x += __low2float(ch[t][f][h]);
+                            acc[h][t][f].y += __high2float(ch[t][f][h]);
+                            ch[t][f][h] = hzero;
+                        }
                     }
             }
         }
@@ -512,18 +537,20 @@ __device__ __forceinline__ void gemv_tile
 
     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
     // tile*16 + frag*8 + 2*(l%4) (+1)
-    if (r0_ok)
+    #pragma unroll
+    for (int h = 0; h < TILE_ROWS / 8; ++h)
     {
+        if (r0 + h * 8 >= nrows) continue;
         const int c0 = 2 * (lane & 3);
-        float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
+        float* red = sh_red + (wk * TILE_ROWS + r0 + h * 8) * TCOLS + wn * COLS;
         #pragma unroll
         for (int t = 0; t < WNT; ++t)
             #pragma unroll
             for (int f = 0; f < 2; ++f)
             {
                 const int col = t * 16 + f * 8 + c0;
-                red[col + 0] = acc0[t][f].x;
-                red[col + 1] = acc0[t][f].y;
+                red[col + 0] = acc[h][t][f].x;
+                red[col + 1] = acc[h][t][f].y;
             }
     }
     __syncthreads();
@@ -535,7 +562,7 @@ __device__ __forceinline__ void gemv_tile
         float sum = 0.0f;
         #pragma unroll
         for (int j = 0; j < WKK; ++j)
-            sum += sh_red[(j * ROWS + r) * TCOLS + c];
+            sum += sh_red[(j * TILE_ROWS + r) * TCOLS + c];
         const size_t idx = (size_t) rows[r] * c_stride + group * TCOLS + c;
         if (c_f32) ((float*) C)[idx] = sum;
         else       ((half*) C)[idx] = __float2half_rn(sum);
@@ -670,6 +697,33 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 #endif
 
 // ---------------------------------------------------------------------------------------------
+// One selection per CTA makes the format branch uniform across its warps.
+// The packed Inkling releases contain these four expert tensor bitrates.
+template <int bits, int cb, bool WIDE, bool HALF, int TILE_ROWS = ROWS, typename... Args>
+__device__ __forceinline__ void routed_tile(const int64_t* rates, int expert, Args... args)
+{
+    if constexpr (bits != 0)
+        gemv_tile<bits, cb, WIDE, HALF, TILE_ROWS>(args...);
+    else
+    {
+        switch (rates[expert])
+        {
+            case 6: gemv_tile<3, 2, WIDE, false, TILE_ROWS>(args...); break;
+            case 7: gemv_tile<3, 2, WIDE, true, TILE_ROWS>(args...); break;
+            case 8: gemv_tile<4, 2, WIDE, false, TILE_ROWS>(args...); break;
+            case 16: gemv_tile<8, 2, WIDE, false, TILE_ROWS>(args...); break;
+        }
+    }
+}
+
+__device__ __forceinline__ float inkling_swiglu(float g, float u, float gc, float uc)
+{
+    g = __half2float(__float2half_rn(g));
+    u = __half2float(__float2half_rn(u));
+    float activation = (gc * tanhf(g / gc)) / (1.0f + expf(-g)) * (uc * tanhf(u / uc));
+    return __half2float(__float2half_rn(activation));
+}
+
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
@@ -682,8 +736,9 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
     constexpr int CPB = tile_cpb<WIDE>();
     extern __shared__ uint32_t smem_dyn[];
     half* sh_A = (half*) smem_dyn;
-    float* sh_red = (float*) (smem_dyn + p.Hi / 2);
-    uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
+    const int a_words = p.Hi / 2 * ((bits == 0 && p.slot_tiles) ? ROWS : 1);
+    float* sh_red = (float*) (smem_dyn + a_words);
+    uint32_t* sh_stage = smem_dyn + a_words + WK * ROWS * COLS;
     __shared__ int sh_flag;
     __shared__ int sh_res[4];
     __shared__ int sh_rows[ROWS];
@@ -709,7 +764,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
     {
         // bsz 1: an inactive slot's blocks (up projection, split 0) write the output chunks of an
         // empty token row, one warp per chunk, strided by the number of gate/up groups
-        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+        if (!p.a_global && !p.slot_tiles && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
         {
             const int row = run_idx / p.topk;
             if (token_active_slots(p, row) == 0)
@@ -735,12 +790,15 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
     {
         // bsz 1: every run is a single slot; rotate its input into shared memory here. A zero
         // row stride makes the tile read it whatever the slot index (which still selects the C row)
-        const SlotInfo si = slot_info(p, sh_rows[0]);
-        for (int c = warp; c < p.Hi / 128; c += WK)
-            rotate_chunk(p, si.row, suh, c, sh_A, lane);
+        const int chunks = p.Hi / 128;
+        for (int j = warp; j < nrows * chunks; j += WK)
+        {
+            const int r = j / chunks;
+            rotate_chunk(p, sh_rows[r] / p.topk, suh, j % chunks, sh_A + r * p.Hi, lane);
+        }
         __syncthreads();
         A2 = (const half2*) sh_A;
-        a_stride2 = 0;
+        a_stride2 = p.slot_tiles ? p.Hi / 2 : 0;
     }
 
     {
@@ -748,7 +806,11 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        const int ntiles = (bits == 0 ? 2 : 1) * p.I / 16;
+        if constexpr (bits == 0)
+            if (!is_gate) B32 += (p.I / 16) * (4 * p.gu_k2[local]);
+        routed_tile<bits, cb, WIDE, HALF>(p.gu_k2, local, B32, A2, a_stride2, sh_rows, nrows, C, p.I,
+                                         p.gu_f32, k_begin, k_end, ntiles, group, sh_red, sh_stage, bits == 0 && p.slot_tiles);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -779,7 +841,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             float u0, u1, u2, u3;
             load_sum(p.gu_u, u0, u1, u2, u3);
             had128(u0, u1, u2, u3, lane);
-            scale_h4(((const half*) p.u_svh[local]) + col, u0, u1, u2, u3);
+            scale_h4(((const half*) p.u_svh[local]) + (bits == 0 ? p.I : 0) + col, u0, u1, u2, u3);
             if (p.u_bias) add_h4(((const half*) p.u_bias[local]) + col, u0, u1, u2, u3);
 
             float g0 = u0, g1 = u1, g2 = u2, g3 = u3;
@@ -791,10 +853,15 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
             }
 
-            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit);
-            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit);
-            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit);
-            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit);
+            auto activate = [&](float g, float u)
+            {
+                if constexpr (bits == 0) return inkling_swiglu(g, u, p.act_limit, p.up_cap);
+                else return act_gate(p.act, p.gated, g, u, p.act_limit);
+            };
+            float a0 = activate(g0, u0);
+            float a1 = activate(g1, u1);
+            float a2 = activate(g2, u2);
+            float a3 = activate(g3, u3);
 
             scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
             had128(a0, a1, a2, a3, lane);
@@ -849,7 +916,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+        routed_tile<bits, cb, WIDE, HALF>(p.down_k2, local, B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
     }
 
@@ -916,6 +983,13 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
             had128(v0, v1, v2, v3, lane);
             scale_h4(((const half*) p.d_svh[sj.local]) + col, v0, v1, v2, v3);
             if (p.d_bias) add_h4(((const half*) p.d_bias[sj.local]) + col, v0, v1, v2, v3);
+            if constexpr (bits == 0)
+            {
+                v0 = __half2float(__float2half_rn(v0));
+                v1 = __half2float(__float2half_rn(v1));
+                v2 = __half2float(__float2half_rn(v2));
+                v3 = __half2float(__float2half_rn(v3));
+            }
             o0 += sj.w * v0;
             o1 += sj.w * v1;
             o2 += sj.w * v2;

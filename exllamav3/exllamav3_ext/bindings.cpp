@@ -194,6 +194,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
+#ifndef USE_ROCM
+    m.def("inkling_qkvg_sq", &inkling_qkvg_sq);
+    m.def("inkling_verify_qkvg_sq", &inkling_qkvg_sq);
+#endif
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
@@ -320,6 +324,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("inkling_moe_coop", &inkling_moe_coop);
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");

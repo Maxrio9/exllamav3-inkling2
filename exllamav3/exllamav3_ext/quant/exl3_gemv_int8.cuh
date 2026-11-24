@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 #include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 
@@ -30,3 +31,10 @@ bool exl3_gemv_int8
     cudaStream_t stream,
     Graph* graph
 );
+
+#ifndef USE_ROCM
+std::vector<at::Tensor> inkling_qkvg_sq(
+    const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh, const std::vector<at::Tensor>& svh,
+    const at::Tensor& counters);
+#endif

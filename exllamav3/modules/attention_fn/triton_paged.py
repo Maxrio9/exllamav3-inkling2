@@ -9,6 +9,7 @@ import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
 from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from ...constants import PAGE_SIZE
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
@@ -1388,6 +1389,8 @@ def _paged_attn_prefill_inner(
     MASKED: tl.constexpr,
     SRC_NEW: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    rel_rows=None, REL_EXTENT: tl.constexpr = 0, h32=None,
+    verify_k=None, verify_v=None, cached_end=0,
 ):
     """One pass over kv tiles [n_start, n_end). With MASKED = False the tiles are known to be
     fully inside the causal/window region for every row and all bounds/mask logic is skipped.
@@ -1402,6 +1405,10 @@ def _paged_attn_prefill_inner(
         page_off = offs_n - page * page_size
         if SRC_NEW:
             phys = tl.zeros((BLOCK_N,), tl.int32)
+        elif verify_k is not None:
+            # Earlier lanes in this verification block are logical cache rows.
+            # Their physical ring slots may still hold history for another query.
+            phys = tl.load(block_table_b + page, mask=offs_n < tl.minimum(n_end, cached_end), other=0)
         elif MASKED:
             phys = tl.load(block_table_b + page, mask = offs_n < n_end, other = 0)
         else:
@@ -1426,6 +1433,9 @@ def _paged_attn_prefill_inner(
                 k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n >= 0, QCK, n_kv_heads, head_dim, HD_PAD)
         else:
             k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+            if verify_k is not None:
+                new_ptrs = verify_k + (((offs_n[None, :] - cached_end) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+                k_ptrs = tl.where(offs_n[None, :] >= cached_end, new_ptrs, k_ptrs)
             if HD_PAD > head_dim:
                 if MASKED:
                     k_tile = tl.load(k_ptrs, mask = (offs_n[None, :] < n_end) & d_mask[:, None], other = 0.0)
@@ -1436,8 +1446,19 @@ def _paged_attn_prefill_inner(
             else:
                 k_tile = tl.load(k_ptrs)
 
+        if REL_EXTENT and QCK > 0:
+            # Only past rows are quantized. Return this tile to the fresh KV basis.
+            k_tile = tl.trans(_rot_h32(tl.trans(k_tile), h32, BLOCK_N, HD_PAD))
         scores = tl.dot(q_tile, k_tile)
-        if SOFTCAP > 0.0:
+        if REL_EXTENT:
+            # Inkling projects a different distance-bias vector for every query and head.
+            distance = q_abs[:, None] - offs_n[None, :]
+            bias = tl.load(rel_rows[:, None] + distance,
+                           mask=valid_row[:, None] & (distance >= 0) & (distance < REL_EXTENT), other=0.)
+            # Match the eager fp16 QK matmul, scale, and add before the fp32 softmax.
+            scaled = (scores.to(tl.float16).to(tl.float32) * (qk_scale_log2e * 0.6931471805599453)).to(tl.float16)
+            scores = (scaled + bias).to(tl.float32) * 1.4426950408889634
+        elif SOFTCAP > 0.0:
             s_nat = scores * (qk_scale_log2e * 0.6931471805599453)  # back to natural units
             s_nat = (2.0 / (1.0 + tl.exp(-2.0 * (s_nat / SOFTCAP))) - 1.0) * SOFTCAP
             scores = s_nat * 1.4426950408889634
@@ -1486,6 +1507,9 @@ def _paged_attn_prefill_inner(
                 v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n >= 0, QCV, n_kv_heads, head_dim, HD_PAD)
         else:
             v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+            if verify_v is not None:
+                new_ptrs = verify_v + (((offs_n[:, None] - cached_end) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+                v_ptrs = tl.where(offs_n[:, None] >= cached_end, new_ptrs, v_ptrs)
             if HD_PAD > head_dim:
                 if MASKED:
                     v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & d_mask[None, :], other = 0.0)
@@ -1495,6 +1519,8 @@ def _paged_attn_prefill_inner(
                 v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
             else:
                 v_tile = tl.load(v_ptrs)
+        if REL_EXTENT and QCV > 0:
+            v_tile = _rot_h32(v_tile, h32, BLOCK_N, HD_PAD)
         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
         m = m_new
     return acc, m, l
@@ -1543,6 +1569,7 @@ def _paged_attn_prefill_kernel(
     WIDE_INDEX: tl.constexpr,  # int64 q/out/partial index math (element offsets past 2^31)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    rel_logits=None, REL_EXTENT: tl.constexpr = 0, VERIFY_ROWS: tl.constexpr = False,
 ):
     """FA2-style prefill over the paged cache: BLOCK_M query rows of one head per program;
     unmasked interior kv tiles take a maskless fast path, only the causal boundary and the
@@ -1555,6 +1582,15 @@ def _paged_attn_prefill_kernel(
     group_size = n_q_heads // n_kv_heads
     kv_head = q_head // group_size
 
+    if VERIFY_ROWS:
+        tl.static_assert(REL_EXTENT > 0 and NEW_KV == 1 and QCK == 0 and QCV == 0 and not IS_SPLIT)
+        # Each program evaluates one query with width-one MMA geometry.
+        row = pid_m
+        pid_m = 0
+        q += row * n_q_heads * head_dim
+        out += row * n_q_heads * head_dim
+        sinks += row * n_q_heads
+        rel_logits += row.to(tl.int64) * n_q_heads * REL_EXTENT
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HD_PAD)
     d_mask = offs_d < head_dim
@@ -1569,10 +1605,12 @@ def _paged_attn_prefill_kernel(
         row64 = batch * q_len + offs_m[:, None]
     q_ptrs = q + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
-    if QCK > 0:
+    if QCK > 0 and not REL_EXTENT:
         q_tile = _rot_h32(q_tile, h32, BLOCK_M, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len - kv_offset
+    if VERIFY_ROWS:
+        total_k_len += row
     q_abs = total_k_len - q_len + offs_m
     qk_scale_log2e = scale * 1.4426950408889634
 
@@ -1633,6 +1671,19 @@ def _paged_attn_prefill_kernel(
         k_new_b = k_new
         v_new_b = v_new
 
+    rel_rows = rel_logits
+    if REL_EXTENT:
+        tl.static_assert(NEW_KV == 1 and not IS_SPLIT and not resume)
+        rel_rows = rel_logits + ((batch * q_len + offs_m.to(tl.int64)) * n_q_heads + q_head) * REL_EXTENT
+
+    verify_k = None
+    verify_v = None
+    cached_end = 0
+    if VERIFY_ROWS:
+        cached_end = past - row
+        verify_k, verify_v = k_new, v_new
+        k_new_b += row * n_kv_heads * head_dim
+        v_new_b += row * n_kv_heads * head_dim
     if NEW_KV == 1:
         # Dual source, everything masked: the boundary at `past` breaks tile alignment, and the
         # only current user (sliding-window attention) runs fully masked regardless
@@ -1640,13 +1691,13 @@ def _paged_attn_prefill_kernel(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, False, BLOCK_N,
+            True, False, BLOCK_N, rel_rows, REL_EXTENT, h32, verify_k, verify_v, cached_end,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
             n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
-            True, True, BLOCK_N,
+            True, True, BLOCK_N, rel_rows, REL_EXTENT, h32,
         )
     elif NEW_KV == 2:
         # Cache known empty: same structure as the cache path, reading the contiguous source
@@ -1707,16 +1758,45 @@ def _paged_attn_prefill_kernel(
     else:
         if HAS_SINKS:
             # m/l live in the log2 domain here, so the sink logit is scaled by log2(e)
-            sink = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
+            if REL_EXTENT:
+                sink = tl.load(sinks + (batch * q_len + offs_m) * n_q_heads + q_head, mask=valid_row, other=0.)
+            else:
+                sink = tl.load(sinks + q_head)
+            sink = sink.to(tl.float32) * 1.4426950408889634
             m_top = tl.maximum(m, sink)
             alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp2(m - m_top))
             acc = acc * alpha_s[:, None]
             l = l * alpha_s + tl.exp2(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-        if QCV > 0:
+        if QCV > 0 and not REL_EXTENT:
             out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
         out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
         tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & d_mask[None, :])
+
+
+def inkling_paged_attention(q, k, v, kc, vc, table, lengths, relative, sinks, window, quant=None, *, verify_rows=False):
+    """Single-sequence paged FlashAttention with fresh KV in its original precision."""
+    _, n, heads, dim = q.shape
+    # Reuse each KV tile across more query rows on a long FP16 prefill.
+    # Keep the key-tile width and online softmax reduction order.
+    block_m = 64 if n >= 64 and dim <= 128 and quant is None else 16
+    block_n = 32
+    out = torch.empty_like(q)
+    page_size = PAGE_SIZE if kc is None else kc.shape[1]
+    if kc is None:
+        # Empty prefix. NEW_KV reads all rows from k/v and never accesses these pointers.
+        kc, vc = k, v
+    sk, sv, kb, vb, h32 = quant if quant is not None else (kc, vc, 0, 0, q)
+    queries = 1 if verify_rows else n
+    grid = (n if verify_rows else triton.cdiv(n, block_m), heads, 1)
+    _paged_attn_prefill_kernel[grid](
+        q, kc, vc, table, lengths, out, out, out, sk, sv, h32, k, v, sinks,
+        1, False, False, 1, kb, vb, queries, queries, 0, heads, k.shape[2], table.shape[1],
+        page_size, dim, max(16, triton.next_power_of_2(dim)), dim ** -0.5,
+        True, window - 1, 0, window > 0, False, 0., True, q.numel() >= 2**31,
+        block_m, block_n, relative, relative.shape[-1], verify_rows, num_warps=4, num_stages=1,
+    )
+    return out
 
 
 @triton.jit

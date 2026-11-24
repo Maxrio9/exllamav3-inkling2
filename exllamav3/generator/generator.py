@@ -5,6 +5,7 @@ import os
 from ..model.model import Model
 from ..model.prefill_pipeline import PrefillPipeline
 from ..cache.cache import Cache
+from ..cache.fp16 import CacheLayer_fp16
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
@@ -16,7 +17,7 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
-from .draft_confidence import DraftConfidenceCalibrator
+from .draft_confidence import scalar_dspark_verifier, DraftConfidenceCalibrator, DSparkGain
 from ..model.moe_cpu_host import set_moe_cpu_hot
 from ..modules.block_sparse_mlp_cpu import promote_tick
 from .job import Job
@@ -76,6 +77,9 @@ class Generator:
         hybrid_draft_tokens: int = 0,
         draft_max_rows: int = 0,
         sparse_draft_head: int = 0,
+        reuse_inkling_graphs: bool = False,
+        dspark_adaptive: bool = True,
+        dspark_probe_interval: int = 64,
         **kwargs
     ):
         """
@@ -160,19 +164,25 @@ class Generator:
             confidence score, calibrated online against observed acceptance rates (see draft_confidence). A
             DFlash drafter still runs at its fixed diffusion block size and only the verified window shrinks;
             AR and MTP drafters stop the drafting loop itself early, saving one drafter forward per pruned
-            position. The acceptance behavior of the surviving positions is unchanged. Has no effect on n-gram
-            drafting, whose draft length already adapts through the match length.
+            position. Sampled Inkling DSpark uses rejection outcomes by proposal depth to trim its
+            Markov head and verification window. Has no effect on n-gram drafting, whose draft length
+            already adapts through the match length.
 
         :param draft_confidence:
             Used with dynamic_draft_tokens and a draft model: target acceptance probability for drafted
             positions, evaluated against an online mapping from drafter confidence scores to observed
             acceptance rates. Scale-free and portable across model pairs. For DFlash (block produced at fixed
             cost) the block is cut at the first position whose estimated conditional acceptance drops below
-            the target. For AR and MTP drafters (one forward per position, and a position only pays off if
-            everything before it is accepted too) drafting stops when the running product of conditional
+            the target. For AR, MTP and sampled Inkling DSpark drafting (a position only pays off if
+            everything before it is accepted too), drafting stops when the running product of conditional
             estimates - the probability that the next position actually contributes a token - falls below the
             target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
             n-gram drafting.
+
+        :param dspark_adaptive:
+            Use target-only steps when completed DSpark rounds cost more per emitted token.
+        :param dspark_probe_interval:
+            Retry drafting after this many target-only tokens when DSpark is slower.
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
@@ -246,6 +256,9 @@ class Generator:
             on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
             offload, attention pinned to one device, a draft model on several devices or reading the target's cache
 
+        :param reuse_inkling_graphs:
+            Keep Inkling CUDA graph buffers for the next job on the same cache slot.
+
         :param kwargs:
         """
 
@@ -254,6 +267,19 @@ class Generator:
         self.tokenizer = tokenizer
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
+
+        if dspark_probe_interval < 1:
+            raise ValueError("DSpark probe interval must be positive")
+        self.dspark_probe_interval = dspark_probe_interval
+        self.dspark_adaptive = dspark_adaptive
+        self.dspark_draft = bool(draft_model and draft_model.caps.get("dspark_draft"))
+        self.scalar_dspark = self.dspark_draft and scalar_dspark_verifier(model.embedding.weight.device)
+        if self.dspark_draft and max_batch_size != 1:
+            raise ValueError("Inkling DSpark supports one sequence at a time")
+        if self.dspark_draft and not issubclass(cache.layer_type, CacheLayer_fp16):
+            raise ValueError("Inkling DSpark requires FP16 KV for token-by-token equivalence")
+        self.reuse_inkling_graphs = reuse_inkling_graphs
+        self._inkling_graphs = {}
 
         # Paging
         self.pagetable = PageTable(self, cache)
@@ -459,6 +485,8 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        if self.mtp_draft and self.target_recurrent:
+            self._warn_inexact_mtp(cache)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -486,6 +514,31 @@ class Generator:
                 embedding = model.modules[0] if self.mtp_draft else None,
             )
             self.sparse_head.benchmark()
+
+
+    @staticmethod
+    def _warn_inexact_mtp(cache):
+        """
+        Greedy MTP output equals plain greedy decoding only if a verify-pass row computes exactly what the same token
+        does in a one-token decode step. Two library defaults break that for a recurrent (GDN) target; note it, since the
+        difference is silent (rare near-tie flips, which then compound). Quality is unaffected.
+        """
+        log = logging.getLogger(__name__)
+        half_state = any(
+            getattr(l, "recurrent_state", None) is not None and l.recurrent_state.dtype == torch.half
+            for l in cache.get_all_recurrent_layers().values()
+        )
+        if half_state:
+            log.info(
+                "MTP drafting with an fp16 recurrent state: greedy output can differ from plain decoding at near-ties "
+                "(both are valid outputs). For bit-identical output use Cache(recurrent_dtype = torch.float)."
+            )
+        if torch.version.hip is None and os.environ.get("EXL3_INT8_GEMV", "2") != "0":
+            log.info(
+                "MTP drafting with EXL3_INT8_GEMV on (the default): 1-2 row calls use the int8-activation GEMV and wider "
+                "verify calls the fp16 kernel, so greedy output can differ from plain decoding at near-ties (both are valid "
+                "outputs). For bit-identical output set EXL3_INT8_GEMV=0 before the model loads."
+            )
 
 
     def num_remaining_jobs(self):
@@ -834,12 +887,46 @@ class Generator:
 
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
         draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
+        sampled_draft = None
+        gain = None
         round_start = None
         if self.sparse_head is not None and draft_window > 0:
             self._sparse_flag = self.sparse_head.round_flag()
             round_start = time.perf_counter()
         if self.draft_model and draft_window > 0:
-            if self.dflash_draft:
+            if self.dspark_draft:
+                job = next((job for job in self.active_jobs if job.is_prefill_done()), None)
+                draft_tokens = None
+                if job is not None:
+                    rule = job.dspark_sampling_rule(hybrid=self.hybrid_draft_tokens > 0)
+                    # A scalar-exact verifier pays for every target step. Preserve the
+                    # explicit fixed/hybrid schedules, and skip greedy probes in adaptive mode.
+                    scalar_only = (self.scalar_dspark and self.dspark_adaptive
+                                   and not self.hybrid_draft_tokens and rule != "rejection")
+                    if job.dspark_rule != rule:
+                        logger.info("DSpark job %s acceptance rule: %s%s", job.serial_number, rule,
+                                    " (scalar target only)" if scalar_only else "")
+                        job.dspark_rule = rule
+                    # Hybrid proposals have a separate selector after this block.
+                    if self.dspark_adaptive and not self.hybrid_draft_tokens and not scalar_only:
+                        if job.dspark_gain is None:
+                            job.dspark_gain = DSparkGain(
+                                self.dspark_probe_interval, backoff=self.scalar_dspark,
+                                narrow_probes=getattr(self.model, 'verify_rows_default', False),
+                            )
+                        gain = job.dspark_gain
+                        gain_start = time.perf_counter()
+                        tokens_before = job.new_tokens
+                    distribution = job.dspark_distribution if rule == "rejection" else None
+                    if not scalar_only and (gain is None or gain.should_draft()):
+                        if distribution is not None and self.draft_calibrator is not None:
+                            draft_window = job.dspark_draft_window(draft_window, self.draft_calibrator.confidence)
+                        if gain is not None:
+                            draft_window = gain.proposal_count(draft_window)
+                        proposal = self.draft_model.propose_for_job(job, self.draft_cache, draft_window, distribution)
+                        if proposal is not None:
+                            draft_tokens, sampled_draft = proposal
+            elif self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
                 # The main model's CPU MoE worker stays hot through the draft, the head's until it ends
@@ -863,7 +950,14 @@ class Generator:
                 draft_tokens, self.row_limited(self.hybrid_draft_tokens)
             )
 
-        self.iterate_gen(results, draft_tokens)
+        if draft_tokens is not None and self.dspark_draft and self.scalar_dspark and sampled_draft is None:
+            self._verify_scalar_dspark(draft_tokens, results)
+        elif sampled_draft is None:
+            self.iterate_gen(results, draft_tokens)
+        else:
+            self.iterate_gen(results, draft_tokens, sampled_draft)
+        if gain is not None:
+            gain.record(draft_tokens is not None, job.new_tokens - tokens_before, time.perf_counter() - gain_start)
         if not self.active_jobs and self.draft_model and self.mtp_draft:
             # No draft follows the last verify: let the workers nap
             set_moe_cpu_hot(self.model.config, text = False, draft = False)
@@ -921,6 +1015,7 @@ class Generator:
         self.sample_pinned = None
         self.staging_buffers = {}
         self.stage_arenas = {}
+        self._inkling_graphs.clear()
         self.draft_input_ids_pinned = None
         self.draft_ids_pinned = None
         self.filter_pool.shutdown(wait = False)
@@ -1526,6 +1621,7 @@ class Generator:
         try:
             target = self.cache.get_new_state() if self.target_recurrent else None
             draft = self.draft_cache.get_new_state() if self.draft_recurrent else None
+            self._reuse_inkling_graphs(target)
             return PairedState(target, draft)
         except BaseException:
             if draft is not None:
@@ -1541,6 +1637,7 @@ class Generator:
         try:
             target = self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None
             draft = self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None
+            self._reuse_inkling_graphs(target)
             return PairedState(target, draft)
         except BaseException:
             if draft is not None:
@@ -1548,6 +1645,27 @@ class Generator:
             if target is not None:
                 target.free()
             raise
+
+
+    # The captured buffers are tied to the model, cache slot and stream.
+    # A fresh or restored request still owns its own convolution state and position.
+    _inkling_graph_fields = ("decode_graphs", "moe_workspace", "window_workspace",
+                             "verify_inputs", "draft_graph", "draft_signature")
+
+    def _reuse_inkling_graphs(self, target):
+        if self.reuse_inkling_graphs and target.slot in self._inkling_graphs:
+            for name, value in zip(self._inkling_graph_fields, self._inkling_graphs.pop(target.slot)):
+                setattr(target, name, value)
+            if target.draft_graph is not None:
+                # Repopulate all visible projected rows from the new job's tap pages.
+                target.draft_graph.length = 0
+
+
+    def release_recurrent_state(self, state: PairedState):
+        if self.reuse_inkling_graphs:
+            target = state.target
+            self._inkling_graphs[target.slot] = tuple(getattr(target, name) for name in self._inkling_graph_fields)
+        state.free()
 
 
     def row_limited(self, window: int) -> int:
@@ -1721,7 +1839,32 @@ class Generator:
             set_moe_cpu_hot(config, text = False, draft = True)
 
 
-    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+    def _verify_scalar_dspark(self, draft_tokens, results):
+        """Check proposals against ordinary scalar samples, with no suffix to rewind."""
+        job = next(job for job in self.active_jobs if job.is_prefill_done())
+        seq, = job.sequences
+        proposals = draft_tokens[0].tolist()
+        # Publish the remainder as rejected up front. An EOS or a requeue
+        # inside an ordinary single-token step then inherits accurate totals.
+        job.rejected_draft_tokens += len(proposals)
+        accepted = 0
+        for proposal in [*proposals, None]:
+            previous = len(seq.sequence_ids)
+            self.iterate_gen(results)
+            if job not in self.active_jobs or len(seq.sequence_ids) != previous + 1:
+                break
+            if proposal is None or job.is_stash_boundary():
+                break
+            if seq.sequence_ids.torch_slice(previous, previous + 1).item() != proposal:
+                break
+            accepted += 1
+            job.accepted_draft_tokens += 1
+            job.rejected_draft_tokens -= 1
+        if self.record_draft_stats:
+            job.draft_stats.append((job.new_tokens, len(proposals), accepted))
+
+
+    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None, sampled_draft=None):
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
@@ -1745,6 +1888,9 @@ class Generator:
         # cover a few distinct widths only; the extra (zeroed) columns are never dereferenced
         # since the kernels bound their reads by the cache lengths
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        if getattr(self, "reuse_inkling_graphs", False):
+            # Keep the captured block table shape stable across requests.
+            max_pages_batch = self.pagetable.max_pages
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
         use_offsets = "mrope" in self.model.caps
         arena = self._stage_arena(batch_size, max_pages_batch, use_offsets)
@@ -1840,7 +1986,9 @@ class Generator:
             "pinned_staging": True,
         }
         self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
-        if self.draft_model:
+        if self.dspark_draft:
+            params["inkling_tap_cache"] = self.draft_cache.layers[(0, 0)]
+        elif self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
@@ -1977,7 +2125,8 @@ class Generator:
                 r = row
                 row += 1
                 batchable = (
-                    not _NO_BATCH_READBACK
+                    sampled_draft is None
+                    and not _NO_BATCH_READBACK
                     and b - a == 1
                     and job.checkpoint is None
                     and job.forced_ids is None
@@ -1999,7 +2148,8 @@ class Generator:
                     staged.append((sampled, False))
                 staged_jobs[id(job)] = (staged, rng_state)
             # Also with nothing staged: the serial walk below waits for this pass anyway
-            self._sync_verify_pass(batch_logits.device)
+            if sampled_draft is None:
+                self._sync_verify_pass(batch_logits.device)
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
@@ -2019,10 +2169,14 @@ class Generator:
                 st = staged_jobs.get(id(job))
                 if st is not None:
                     staged, rng_state = st
-                for i in range(W):
+                exact = job.sample_dspark(job_logits, *sampled_draft) if sampled_draft is not None else None
+                for i in range(len(exact.tokens) if exact is not None else W):
                     positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
-                    if staged is not None:
+                    if exact is not None:
+                        token = torch.tensor([[exact.tokens[i]]], dtype=torch.long)
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.describe_sample(token_logits, token)
+                    elif staged is not None:
                         (next_token, next_k_tokens, next_k_probs, next_prob), _ = staged[i]
                     else:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
@@ -2076,13 +2230,13 @@ class Generator:
                             rejected = -1
                         break
 
-                    # Continue sampling from logit batch as long as result matches draft, unless hitting
-                    # checkpoint mark. For speculative decoding, consume additional logits only while the
-                    # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
-                    # draft acceptance so state can be stashed at an exact page boundary.
+                    # Consume additional logits only while proposals are accepted and stop
+                    # at a recurrent checkpoint so state can be stashed at that boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_stash_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        accepted = (i < exact.accepted if exact is not None else
+                                    draft_tokens[j, i].item() == sampled_token.item())
+                        if not accepted or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -2114,6 +2268,9 @@ class Generator:
                     job.rng.setstate(rng_state)
                     for _ in range(positions_used):
                         job.rng.randint(0, (1 << 32) - 1)
+
+                if exact is not None:
+                    job.record_dspark_acceptance(W - 1, positions_used, exact.accepted)
 
                 # Make sure outgoing state is valid if entire draft was accepted
                 if batch_states and draft_tokens is not None and rejected == 0:
