@@ -1,3 +1,5 @@
+> **Superseded.** Inkling 2 Mini EXL3 is now served by the TensorFold engine with the DSpark drafter, FP8 KV and parallel requests: [engine branch](https://github.com/Maxrio9/TensorFold/tree/inkling2-mini-exl3), [recipes](https://github.com/Maxrio9/inkling-2-mini-exl3-recipes). This repository stays as it is for reference.
+
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
